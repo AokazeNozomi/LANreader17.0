@@ -2,7 +2,9 @@
 [<img src="https://img.shields.io/github/release/doraemoe/lanreader.svg?display_name=tag">](https://github.com/Doraemoe/LANreader/releases/latest)
 [![Continuous Integration](https://github.com/Doraemoe/LANreader/actions/workflows/ci.yml/badge.svg)](https://github.com/Doraemoe/LANreader/actions/workflows/ci.yml)
 
-# LANreader
+# LANreader 17.0
+
+!> This is a fork to lower the minimum iOS version to 17.0, which is the last version that supports the TrollStore exploit for installing unsigned apps. The original app requires min iOS 17.2.
 
 LANreader is an iOS manga reader for [LANraragi](https://github.com/Difegue/LANraragi)
 
