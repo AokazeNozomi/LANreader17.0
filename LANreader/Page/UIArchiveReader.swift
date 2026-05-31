@@ -62,9 +62,10 @@ class UIArchiveReaderController: UIViewController {
 
     private func setupObserve() {
         observe { [weak self] in
-            guard let self,
-                  self.navigationController?.topViewController === self else { return }
-            self.navigationController?.setNavigationBarHidden(store.controlUiHidden, animated: false)
+            guard let self else { return }
+            let controlUiHidden = store.controlUiHidden
+            guard self.navigationController?.topViewController === self else { return }
+            self.navigationController?.setNavigationBarHidden(controlUiHidden, animated: false)
         }
 
         observe { [weak self] in
@@ -94,5 +95,20 @@ class UIArchiveReaderController: UIViewController {
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         navigationController?.setNavigationBarHidden(false, animated: animated)
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        cleanupSliderPreviewResourcesIfNeeded()
+    }
+
+    func cleanupSliderPreviewResourcesIfNeeded(
+        movingFromParent: Bool? = nil,
+        beingDismissed: Bool? = nil
+    ) {
+        let shouldCleanup = (movingFromParent ?? isMovingFromParent)
+            || (beingDismissed ?? isBeingDismissed)
+        guard shouldCleanup else { return }
+        store.send(.cleanupSliderPreviewResources)
     }
 }

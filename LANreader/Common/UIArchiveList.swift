@@ -33,6 +33,19 @@ import Logging
         var currentTab: TabName
 
         var archivesToDisplay: IdentifiedArrayOf<GridFeature.State> = []
+
+        // Library/category can load an unfiltered list; Search treats an empty filter as no query yet.
+        var canLoadArchives: Bool {
+            currentTab != .search || hasSearchFilter
+        }
+
+        private var hasSearchFilter: Bool {
+            guard currentTab == .search else { return true }
+            if filter.category != nil {
+                return true
+            }
+            return filter.filter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        }
     }
 
     public enum Action: Equatable {
@@ -86,6 +99,10 @@ import Logging
                 state.archives = .init()
                 return .none
             case let .load(showLoading):
+                guard state.canLoadArchives else {
+                    clearArchives(state: &state)
+                    return .none
+                }
                 guard state.loading == false else {
                     return .none
                 }
@@ -100,6 +117,9 @@ import Logging
                     searchFilter: state.filter, sortby: sortby, start: "0", order: order, append: false
                 )
             case let .appendArchives(start):
+                guard state.canLoadArchives else {
+                    return .none
+                }
                 guard state.loading == false else {
                     return .none
                 }
@@ -417,6 +437,14 @@ import Logging
         .ifLet(\.$alert, action: \.alert)
     }
 
+    func clearArchives(state: inout State) {
+        state.archivesToDisplay = .init()
+        state.archives = .init()
+        state.total = 0
+        state.loading = false
+        state.showLoading = false
+    }
+
     func populateTags(state: inout State) {
         let currentTime = Date().timeIntervalSince1970
         let lastUpdateTime = state.lastTagRefresh
@@ -513,53 +541,91 @@ class UIArchiveListViewController: UIViewController {
     }
 
     func setupCollectionView() {
-        let layout = UICollectionViewCompositionalLayout { _, layoutEnvironment -> NSCollectionLayoutSection? in
-            let containerWidth = layoutEnvironment.container.effectiveContentSize.width
-            let columns = max(Int(containerWidth / 180), 1)
-            let interItemSpacing: CGFloat = 8.0
-            let totalSpacing = CGFloat(columns - 1) * interItemSpacing
-
-            let availableWidth = containerWidth - totalSpacing
-            let cellWidth = availableWidth / CGFloat(columns)
-            let cellHeight = (cellWidth / 2.0 * 3.0) + 10.0
-
-            let itemSize = NSCollectionLayoutSize(
-                widthDimension: .fractionalWidth(1.0 / CGFloat(columns)),
-                heightDimension: .fractionalHeight(1.0)
-            )
-            let item = NSCollectionLayoutItem(layoutSize: itemSize)
-            item.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 4, bottom: 4, trailing: 4)
-
-            let groupSize = NSCollectionLayoutSize(
-                widthDimension: .fractionalWidth(1.0),
-                heightDimension: .absolute(cellHeight)
-            )
-            let group = NSCollectionLayoutGroup.horizontal(
-                layoutSize: groupSize,
-                repeatingSubitem: item,
-                count: columns
-            )
-            group.interItemSpacing = .fixed(interItemSpacing)
-
-            let section = NSCollectionLayoutSection(group: group)
-
-            let footerSize = NSCollectionLayoutSize(
-                widthDimension: .fractionalWidth(1.0),
-                heightDimension: .absolute(80)
-            )
-            let footer = NSCollectionLayoutBoundarySupplementaryItem(
-                layoutSize: footerSize,
-                elementKind: UICollectionView.elementKindSectionFooter,
-                alignment: .bottom
-            )
-            section.boundarySupplementaryItems = [footer]
-
-            return section
-        }
+        let layout = makeCollectionViewLayout()
+        view.backgroundColor = .systemGroupedBackground
         collectionView = UICollectionView(frame: view.bounds, collectionViewLayout: layout)
-        collectionView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        collectionView.backgroundColor = .systemGroupedBackground
+        collectionView.contentInsetAdjustmentBehavior = .automatic
         collectionView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(collectionView)
+        NSLayoutConstraint.activate([
+            collectionView.topAnchor.constraint(equalTo: view.topAnchor),
+            collectionView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            collectionView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            collectionView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
+        ])
+    }
+
+    private func makeCollectionViewLayout() -> UICollectionViewCompositionalLayout {
+        UICollectionViewCompositionalLayout { _, layoutEnvironment -> NSCollectionLayoutSection? in
+            Self.makeArchiveGridSection(layoutEnvironment: layoutEnvironment)
+        }
+    }
+
+    private static func makeArchiveGridSection(
+        layoutEnvironment: NSCollectionLayoutEnvironment
+    ) -> NSCollectionLayoutSection {
+        let containerWidth = layoutEnvironment.container.effectiveContentSize.width
+        let sideInset: CGFloat = 12.0
+        let interItemSpacing: CGFloat = 12.0
+        let contentWidth = max(containerWidth - sideInset * 2, 1)
+        let columns = max(Int(contentWidth / 172), 1)
+        let totalSpacing = CGFloat(columns - 1) * interItemSpacing
+        let cellWidth = (contentWidth - totalSpacing) / CGFloat(columns)
+        let cellHeight = cellWidth / ArchiveGridMetrics.coverAspectRatio + 4.0
+
+        let itemSize = NSCollectionLayoutSize(
+            widthDimension: .fractionalWidth(1.0 / CGFloat(columns)),
+            heightDimension: .fractionalHeight(1.0)
+        )
+        let item = NSCollectionLayoutItem(layoutSize: itemSize)
+        let group = makeArchiveGridGroup(
+            item: item,
+            columns: columns,
+            cellHeight: cellHeight,
+            interItemSpacing: interItemSpacing
+        )
+        let section = NSCollectionLayoutSection(group: group)
+        section.contentInsets = NSDirectionalEdgeInsets(
+            top: 12,
+            leading: sideInset,
+            bottom: 20,
+            trailing: sideInset
+        )
+        section.interGroupSpacing = interItemSpacing
+        section.boundarySupplementaryItems = [makeArchiveGridFooter()]
+        return section
+    }
+
+    private static func makeArchiveGridGroup(
+        item: NSCollectionLayoutItem,
+        columns: Int,
+        cellHeight: CGFloat,
+        interItemSpacing: CGFloat
+    ) -> NSCollectionLayoutGroup {
+        let groupSize = NSCollectionLayoutSize(
+            widthDimension: .fractionalWidth(1.0),
+            heightDimension: .absolute(cellHeight)
+        )
+        let group = NSCollectionLayoutGroup.horizontal(
+            layoutSize: groupSize,
+            repeatingSubitem: item,
+            count: columns
+        )
+        group.interItemSpacing = .fixed(interItemSpacing)
+        return group
+    }
+
+    private static func makeArchiveGridFooter() -> NSCollectionLayoutBoundarySupplementaryItem {
+        let footerSize = NSCollectionLayoutSize(
+            widthDimension: .fractionalWidth(1.0),
+            heightDimension: .absolute(80)
+        )
+        return NSCollectionLayoutBoundarySupplementaryItem(
+            layoutSize: footerSize,
+            elementKind: UICollectionView.elementKindSectionFooter,
+            alignment: .bottom
+        )
     }
 
     func setupRefresh() {

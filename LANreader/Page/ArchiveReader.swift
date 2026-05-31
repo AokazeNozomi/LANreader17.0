@@ -20,6 +20,7 @@ import UIKit
         @SharedReader(.appStorage(SettingsKey.readDirection)) var readDirection = ReadDirection.leftRight.rawValue
         @SharedReader(.appStorage(SettingsKey.serverProgress)) var serverProgress = false
         @SharedReader(.appStorage(SettingsKey.splitWideImage)) var splitImage = false
+        @SharedReader(.appStorage(SettingsKey.splitPiorityLeft)) var piorityLeft = false
         @SharedReader(.appStorage(SettingsKey.autoPageInterval)) var autoPageInterval = 5.0
         @SharedReader(.appStorage(SettingsKey.doublePageLayout)) var doublePageLayout = false
 
@@ -27,6 +28,8 @@ import UIKit
         var currentPageIndex = 0
         var scrollRequest: ScrollRequest?
         var pages: IdentifiedArrayOf<PageFeature.State> = []
+        var collectionScrolling = false
+        var pendingSplitResolutions: [String: Bool] = [:]
         var fromStart = false
         var extracting = false
         var controlUiHidden = false
@@ -100,6 +103,8 @@ import UIKit
         case requestJump(Int, source: ReaderNavigationSource)
         case navigate(ReaderNavigationDirection, source: ReaderNavigationSource)
         case scrollRequestHandled(UUID)
+        case collectionScrollStarted
+        case collectionScrollEnded
         case prepareSliderPreviewThumbnails
         case sliderPreviewThumbnailsQueued(PageThumbnailQueueResponse)
         case pollSliderPreviewThumbnailJob(Int)
@@ -250,6 +255,7 @@ import UIKit
                 guard !state.pages.isEmpty else { return .none }
                 let clampedIndex = ReaderPositioning.clampedPageIndex(index, pageCount: state.pages.count)
                 guard clampedIndex != state.currentPageIndex else { return .none }
+                self.preparePendingSplitMode(state: &state, pageIndex: clampedIndex)
                 state.currentPageIndex = clampedIndex
                 guard let currentArchive = state.allArchives[id: state.currentArchiveId],
                       let page = state.currentPage else { return .none }
@@ -288,6 +294,13 @@ import UIKit
                     source: source,
                     animated: source != .slider && source != .initialRestore
                 )
+                return .none
+            case .collectionScrollStarted:
+                state.collectionScrolling = true
+                return .none
+            case .collectionScrollEnded:
+                state.collectionScrolling = false
+                self.applyPendingSplitResolutions(state: &state)
                 return .none
             case .prepareSliderPreviewThumbnails:
                 guard !state.cached, !state.pages.isEmpty else { return .none }
@@ -489,6 +502,7 @@ import UIKit
                 ) else {
                     return .none
                 }
+                self.preparePendingSplitMode(state: &state, pageIndex: targetIndex)
                 state.scrollRequest = ScrollRequest(
                     id: uuid(),
                     targetPageIndex: targetIndex,
@@ -541,18 +555,11 @@ import UIKit
                 return .none
             case .binding:
                 return .none
-            case let .page(.element(id: id, action: .insertPage(mode))):
-                guard let current = state.pages[id: id] else { return .none }
-                let currentIndex = state.pages.index(id: id)!
-                state.pages.insert(
-                    PageFeature.State(
-                        archiveId: state.currentArchiveId,
-                        pageId: current.pageId,
-                        pageNumber: current.pageNumber,
-                        pageMode: mode,
-                        cached: current.cached
-                    ),
-                    at: currentIndex + 1
+            case let .page(.element(id: id, action: .storedImageResolved(shouldDisplayAsSplitPages))):
+                self.handleSplitResolution(
+                    id: id,
+                    shouldDisplayAsSplitPages: shouldDisplayAsSplitPages,
+                    state: &state
                 )
                 return .none
             case .page:
@@ -585,7 +592,9 @@ import UIKit
                     } else {
                         return .cancel(id: CancelId.autoPage)
                     }
-                    if canAdvance && state.readDirection != ReadDirection.upDown.rawValue && state.doublePageLayout {
+                    if canAdvance
+                        && state.readDirection != ReadDirection.upDown.rawValue
+                        && state.doublePageLayout {
                         let previousIdx = idx - 1
                         if previousIdx >= 0 && previousIdx < state.pages.count {
                             let page = state.pages[previousIdx]
@@ -712,6 +721,140 @@ import UIKit
         .ifLet(\.$alert, action: \.alert)
     }
 
+    private func preparePendingSplitMode(
+        state: inout State,
+        pageIndex: Int
+    ) {
+        guard state.splitImage else { return }
+        guard state.pages.indices.contains(pageIndex) else { return }
+        guard state.pages[pageIndex].pageMode == .loading else { return }
+
+        state.pages[pageIndex].pendingSplitMode = if pageIndex < state.currentPageIndex {
+            PageMode.trailingSplitMode(priorityLeft: state.piorityLeft)
+        } else {
+            PageMode.preferredSplitMode(priorityLeft: state.piorityLeft)
+        }
+    }
+
+    private func handleSplitResolution(
+        id: PageFeature.State.ID,
+        shouldDisplayAsSplitPages: Bool,
+        state: inout State
+    ) {
+        guard state.pages[id: id] != nil else { return }
+        if state.collectionScrolling {
+            state.pendingSplitResolutions[id] = shouldDisplayAsSplitPages
+            return
+        }
+
+        applySplitResolution(
+            id: id,
+            shouldDisplayAsSplitPages: shouldDisplayAsSplitPages,
+            state: &state
+        )
+    }
+
+    private func applyPendingSplitResolutions(state: inout State) {
+        let pending = state.pendingSplitResolutions
+        state.pendingSplitResolutions = [:]
+
+        for pageId in state.pages.map(\.id) where pending[pageId] != nil {
+            applySplitResolution(
+                id: pageId,
+                shouldDisplayAsSplitPages: pending[pageId] ?? false,
+                state: &state
+            )
+        }
+    }
+
+    private func applySplitResolution(
+        id: PageFeature.State.ID,
+        shouldDisplayAsSplitPages: Bool,
+        state: inout State
+    ) {
+        let visiblePageId = state.currentPage?.id
+
+        guard shouldDisplayAsSplitPages,
+              state.splitImage else {
+            normalizePageDisplay(id: id, state: &state)
+            preserveVisiblePage(id: visiblePageId, state: &state)
+            return
+        }
+
+        applySplitPageDisplay(id: id, state: &state)
+        preserveVisiblePage(id: visiblePageId, state: &state)
+    }
+
+    private func applySplitPageDisplay(
+        id: PageFeature.State.ID,
+        state: inout State
+    ) {
+        guard let current = state.pages[id: id],
+              let sourcePageIndex = state.pages.index(id: id) else {
+            return
+        }
+
+        let splitMode: PageMode
+        if current.pageMode.isSplitMode {
+            splitMode = current.pageMode
+        } else {
+            splitMode = current.pendingSplitMode
+                ?? PageMode.preferredSplitMode(priorityLeft: state.piorityLeft)
+        }
+
+        state.pages[id: id]?.pageMode = splitMode
+        state.pages[id: id]?.pendingSplitMode = nil
+        state.pages[id: id]?.imageLoaded = true
+
+        guard let siblingMode = splitMode.splitSiblingMode else { return }
+        var insertedPage = PageFeature.State(
+            archiveId: state.currentArchiveId,
+            pageId: current.pageId,
+            pageNumber: current.pageNumber,
+            pageMode: siblingMode,
+            cached: current.cached
+        )
+        insertedPage.imageLoaded = true
+        guard state.pages[id: insertedPage.id] == nil else { return }
+
+        let leadingSplitMode = PageMode.preferredSplitMode(priorityLeft: state.piorityLeft)
+        let insertAfterCurrent = splitMode == leadingSplitMode
+        let insertedIndex = insertAfterCurrent ? sourcePageIndex + 1 : sourcePageIndex
+        state.pages.insert(insertedPage, at: insertedIndex)
+    }
+
+    private func normalizePageDisplay(
+        id: PageFeature.State.ID,
+        state: inout State
+    ) {
+        guard let current = state.pages[id: id] else { return }
+        let canonicalId = "\(current.pageId)-\(PageMode.normal.identitySuffix)"
+        let keepId = state.pages[id: canonicalId] == nil ? id : canonicalId
+
+        state.pages[id: keepId]?.pageMode = .normal
+        state.pages[id: keepId]?.pendingSplitMode = nil
+        state.pages[id: keepId]?.imageLoaded = true
+
+        state.pages.removeAll {
+            $0.pageId == current.pageId && $0.id != keepId && $0.pageMode.isSplitMode
+        }
+    }
+
+    private func preserveVisiblePage(
+        id visiblePageId: PageFeature.State.ID?,
+        state: inout State
+    ) {
+        if let visiblePageId,
+           let preservedIndex = state.pages.index(id: visiblePageId) {
+            state.currentPageIndex = preservedIndex
+        } else {
+            state.currentPageIndex = ReaderPositioning.clampedPageIndex(
+                state.currentPageIndex,
+                pageCount: state.pages.count
+            )
+        }
+    }
+
     private func updateSliderPreview(
         state: inout State,
         pageIndex: Int
@@ -791,6 +934,8 @@ import UIKit
         state.pages = []
         state.currentPageIndex = 0
         state.scrollRequest = nil
+        state.collectionScrolling = false
+        state.pendingSplitResolutions = [:]
         state.inCache = false
         state.errorMessage = ""
         state.successMessage = ""
@@ -896,12 +1041,8 @@ struct ArchiveReader: View {
                 navigationHelper?.pop()
             }
         }
-        .onDisappear {
-            store.send(.cleanupSliderPreviewResources)
-        }
     }
 
-    // swiftlint:disable function_body_length
     @MainActor
     @ViewBuilder
     private func bottomToolbar(
@@ -911,8 +1052,7 @@ struct ArchiveReader: View {
         if !store.pages.isEmpty {
             let isRightToLeft = store.resolvedReadDirection == .rightLeft
             let bubbleLayout = sliderPreviewBubbleLayout(readerSize: readerSize)
-            let sliderHorizontalPadding: CGFloat = 16
-            let bubbleVerticalSpacing: CGFloat = 14
+            let sliderHorizontalPadding = ReaderToolbarMetrics.sliderHorizontalPadding
             let sliderDisplayIndex = store.sliderDraftIndex ?? store.currentPageIndex
             let sliderDisplayValue = Double(sliderDisplayIndex)
             let displayIndex = ReaderPositioning.clampedPageIndex(
@@ -921,138 +1061,276 @@ struct ArchiveReader: View {
             )
             let displayPageNumber = store.pages[displayIndex].pageNumber
             let sliderMaxIndex = max(store.pages.count - 1, 1)
+            let sliderContext = ReaderSliderContext(
+                displayValue: sliderDisplayValue,
+                maxIndex: sliderMaxIndex,
+                horizontalPadding: sliderHorizontalPadding,
+                isRightToLeft: isRightToLeft
+            )
 
-            VStack(spacing: 0) {
+            VStack(spacing: ReaderToolbarMetrics.previewBottomSpacing) {
                 if store.sliderPreviewVisible {
-                    GeometryReader { geometry in
-                        let bubbleLeadingX = SliderPreviewPositioning.bubbleLeadingX(
-                            pageIndex: displayIndex,
-                            pageCount: store.pages.count,
-                            track: SliderPreviewTrackGeometry(
-                                rowWidth: geometry.size.width,
-                                sliderHorizontalPadding: sliderHorizontalPadding,
-                                bubbleWidth: bubbleLayout.width
-                            ),
-                            isRightToLeft: isRightToLeft
-                        )
-
-                        SliderPreviewBubble(
-                            imageURL: store.sliderPreviewImageURL,
-                            loading: store.sliderPreviewLoading,
-                            imageHeight: bubbleLayout.imageHeight
-                        )
-                        .frame(width: bubbleLayout.width)
-                        .offset(x: bubbleLeadingX)
-                        .allowsHitTesting(false)
-                    }
-                    .frame(height: bubbleLayout.rowHeight)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, bubbleVerticalSpacing)
-                    .environment(\.layoutDirection, .leftToRight)
-                    .transition(.opacity)
+                    sliderPreviewRow(
+                        store: store,
+                        displayIndex: displayIndex,
+                        isRightToLeft: isRightToLeft,
+                        bubbleLayout: bubbleLayout,
+                        sliderHorizontalPadding: sliderHorizontalPadding
+                    )
                 }
 
-                Grid {
-                    GridRow {
-                        Button(action: {
-                            let indexString = store.pages[store.safeCurrentPageIndex].id
-                            store.send(.page(.element(id: indexString, action: .load(true))))
-                        }, label: {
-                            Image(systemName: "arrow.clockwise")
-                        })
-                        .disabled(store.cached)
-                        Button {
-                            store.send(.showAutoPageConfig)
-                        } label: {
-                            Image(systemName: "play")
-                        }
-                        .disabled(store.readDirection == ReadDirection.upDown.rawValue)
-                        Text(String(format: "%d/%d",
-                                    displayPageNumber,
-                                    store.archivePageCount))
-                        .bold()
-                        Button {
-                            if store.cached || store.inCache {
-                                store.send(.removeCache)
-                            } else {
-                                store.send(.downloadPages)
-                            }
-                        } label: {
-                            store.cached || store.inCache ?
-                            Image(systemName: "trash") : Image(systemName: "arrowshape.down")
-                        }
-                        Button(action: {
-                            Task {
-                                store.send(.setThumbnail)
-                            }
-                        }, label: {
-                            Image(systemName: "photo.artframe")
-                        })
-                        .disabled(store.settingThumbnail || store.cached)
-                    }
-                    GridRow {
-                        GeometryReader { geometry in
-                            let sliderWidth = max(geometry.size.width - sliderHorizontalPadding * 2, 1)
+                readerControlPanel(
+                    store: store,
+                    displayPageNumber: displayPageNumber,
+                    sliderContext: sliderContext
+                )
+            }
+            .padding(.horizontal, ReaderToolbarMetrics.outerHorizontalPadding)
+            .padding(.bottom, ReaderToolbarMetrics.bottomPadding)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
 
-                            ZStack {
-                                Slider(
-                                    value: .constant(sliderDisplayValue),
-                                    in: 0...Double(sliderMaxIndex),
-                                    step: 1
-                                )
-                                .padding(.horizontal, sliderHorizontalPadding)
-                                .scaleEffect(x: isRightToLeft ? -1 : 1, y: 1)
-                                .allowsHitTesting(false)
+    private func sliderPreviewRow(
+        store: StoreOf<ArchiveReaderFeature>,
+        displayIndex: Int,
+        isRightToLeft: Bool,
+        bubbleLayout: SliderPreviewBubbleLayout,
+        sliderHorizontalPadding: CGFloat
+    ) -> some View {
+        GeometryReader { geometry in
+            let bubbleLeadingX = SliderPreviewPositioning.bubbleLeadingX(
+                pageIndex: displayIndex,
+                pageCount: store.pages.count,
+                track: SliderPreviewTrackGeometry(
+                    rowWidth: geometry.size.width,
+                    sliderHorizontalPadding: sliderHorizontalPadding,
+                    bubbleWidth: bubbleLayout.width
+                ),
+                isRightToLeft: isRightToLeft
+            )
 
-                                Rectangle()
-                                    .fill(Color.clear)
-                                    .contentShape(Rectangle())
-                                    .gesture(
-                                        DragGesture(minimumDistance: 0)
-                                            .onChanged { value in
-                                                if !store.sliderDragging {
-                                                    store.send(.sliderDragStarted)
-                                                }
-                                                store.send(
-                                                    .sliderDragChanged(
-                                                        SliderPreviewPositioning.pageIndex(
-                                                            at: value.location.x,
-                                                            sliderWidth: sliderWidth,
-                                                            horizontalPadding: sliderHorizontalPadding,
-                                                            sliderMaxIndex: sliderMaxIndex,
-                                                            isRightToLeft: isRightToLeft
-                                                        )
-                                                    )
-                                                )
-                                            }
-                                            .onEnded { value in
-                                                store.send(
-                                                    .sliderDragChanged(
-                                                        SliderPreviewPositioning.pageIndex(
-                                                            at: value.location.x,
-                                                            sliderWidth: sliderWidth,
-                                                            horizontalPadding: sliderHorizontalPadding,
-                                                            sliderMaxIndex: sliderMaxIndex,
-                                                            isRightToLeft: isRightToLeft
-                                                        )
-                                                    )
-                                                )
-                                                store.send(.sliderDragEnded)
-                                            }
-                                    )
-                            }
-                        }
-                        .frame(height: 44)
-                        .gridCellColumns(5)
-                        .environment(\.layoutDirection, .leftToRight)
-                    }
+            SliderPreviewBubble(
+                imageURL: store.sliderPreviewImageURL,
+                loading: store.sliderPreviewLoading,
+                imageHeight: bubbleLayout.imageHeight
+            )
+            .frame(width: bubbleLayout.width)
+            .offset(x: bubbleLeadingX)
+            .allowsHitTesting(false)
+        }
+        .frame(height: bubbleLayout.rowHeight)
+        .environment(\.layoutDirection, .leftToRight)
+        .transition(.opacity)
+    }
+
+    private func readerControlPanel(
+        store: StoreOf<ArchiveReaderFeature>,
+        displayPageNumber: Int,
+        sliderContext: ReaderSliderContext
+    ) -> some View {
+        VStack(spacing: 10) {
+            readerActionRow(
+                store: store,
+                displayPageNumber: displayPageNumber
+            )
+            readerPageSlider(
+                store: store,
+                context: sliderContext
+            )
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 12)
+        .padding(.bottom, 10)
+        .background(
+            .ultraThinMaterial,
+            in: RoundedRectangle(cornerRadius: ReaderToolbarMetrics.panelCornerRadius, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: ReaderToolbarMetrics.panelCornerRadius, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        }
+        .shadow(color: Color.black.opacity(0.18), radius: 18, x: 0, y: 8)
+    }
+
+    private func readerActionRow(
+        store: StoreOf<ArchiveReaderFeature>,
+        displayPageNumber: Int
+    ) -> some View {
+        let cacheActionRemoves = store.cached || store.inCache
+        let autoPageDisabled = store.readDirection == ReadDirection.upDown.rawValue
+
+        return HStack(spacing: 10) {
+            readerToolbarButton(
+                systemImage: "arrow.clockwise",
+                tint: Color(uiColor: .systemBlue),
+                disabled: store.cached,
+                accessibilityLabel: "archive.reader.reload.currentPage"
+            ) {
+                let indexString = store.pages[store.safeCurrentPageIndex].id
+                store.send(.page(.element(id: indexString, action: .load(true))))
+            }
+
+            readerToolbarButton(
+                systemImage: "play.fill",
+                tint: Color(uiColor: .systemPurple),
+                disabled: autoPageDisabled,
+                accessibilityLabel: "archive.reader.autoPage"
+            ) {
+                store.send(.showAutoPageConfig)
+            }
+
+            Spacer(minLength: 2)
+
+            pageCounter(
+                currentPage: displayPageNumber,
+                pageCount: store.archivePageCount
+            )
+
+            Spacer(minLength: 2)
+
+            readerToolbarButton(
+                systemImage: cacheActionRemoves ? "trash.fill" : "tray.and.arrow.down.fill",
+                tint: cacheActionRemoves ? Color(uiColor: .systemRed) : Color(uiColor: .systemOrange),
+                accessibilityLabel: cacheActionRemoves ? "archive.reader.cache.remove" : "archive.reader.pages.download"
+            ) {
+                if cacheActionRemoves {
+                    store.send(.removeCache)
+                } else {
+                    store.send(.downloadPages)
                 }
-                .padding()
-                .background(.thinMaterial)
+            }
+
+            readerToolbarButton(
+                systemImage: "photo.artframe",
+                tint: Color(uiColor: .systemTeal),
+                disabled: store.settingThumbnail || store.cached,
+                accessibilityLabel: "archive.thumbnail.current"
+            ) {
+                store.send(.setThumbnail)
             }
         }
     }
-    // swiftlint:enable function_body_length
+
+    private func pageCounter(currentPage: Int, pageCount: Int) -> some View {
+        HStack(spacing: 4) {
+            Text("\(currentPage)")
+            Text(verbatim: "/")
+                .foregroundStyle(.secondary)
+            Text("\(pageCount)")
+        }
+        .font(.callout.weight(.semibold))
+        .monospacedDigit()
+        .lineLimit(1)
+        .minimumScaleFactor(0.8)
+        .padding(.horizontal, 12)
+        .frame(minWidth: 86, minHeight: 36)
+        .foregroundStyle(.primary)
+        .background(Color(uiColor: .tertiarySystemFill), in: Capsule())
+        .environment(\.layoutDirection, .leftToRight)
+        .accessibilityLabel(
+            Text(verbatim: pageCounterAccessibilityLabel(currentPage: currentPage, pageCount: pageCount))
+        )
+    }
+
+    private func pageCounterAccessibilityLabel(currentPage: Int, pageCount: Int) -> String {
+        let format = String(localized: "archive.reader.page.accessibility %lld %lld")
+        return String(format: format, Int64(currentPage), Int64(pageCount))
+    }
+
+    private func readerToolbarButton(
+        systemImage: String,
+        tint: Color,
+        disabled: Bool = false,
+        accessibilityLabel: LocalizedStringKey,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(disabled ? Color.secondary : tint)
+                .frame(width: ReaderToolbarMetrics.buttonSize, height: ReaderToolbarMetrics.buttonSize)
+                .background(Color(uiColor: .secondarySystemBackground).opacity(0.82), in: Circle())
+                .overlay {
+                    Circle()
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                }
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .opacity(disabled ? 0.42 : 1)
+        .accessibilityLabel(Text(accessibilityLabel))
+    }
+
+    private func readerPageSlider(
+        store: StoreOf<ArchiveReaderFeature>,
+        context: ReaderSliderContext
+    ) -> some View {
+        GeometryReader { geometry in
+            let sliderWidth = max(geometry.size.width - context.horizontalPadding * 2, 1)
+
+            ZStack {
+                Slider(
+                    value: .constant(context.displayValue),
+                    in: 0...Double(context.maxIndex),
+                    step: 1
+                )
+                .tint(Color(uiColor: .systemBlue))
+                .padding(.horizontal, context.horizontalPadding)
+                .scaleEffect(x: context.isRightToLeft ? -1 : 1, y: 1)
+                .allowsHitTesting(false)
+
+                Rectangle()
+                    .fill(Color.clear)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { value in
+                                if !store.sliderDragging {
+                                    store.send(.sliderDragStarted)
+                                }
+                                sendSliderDragChanged(
+                                    store: store,
+                                    locationX: value.location.x,
+                                    sliderWidth: sliderWidth,
+                                    context: context
+                                )
+                            }
+                            .onEnded { value in
+                                sendSliderDragChanged(
+                                    store: store,
+                                    locationX: value.location.x,
+                                    sliderWidth: sliderWidth,
+                                    context: context
+                                )
+                                store.send(.sliderDragEnded)
+                            }
+                    )
+            }
+        }
+        .frame(height: 34)
+        .environment(\.layoutDirection, .leftToRight)
+        .accessibilityLabel(Text("archive.reader.page.slider"))
+    }
+
+    private func sendSliderDragChanged(
+        store: StoreOf<ArchiveReaderFeature>,
+        locationX: CGFloat,
+        sliderWidth: CGFloat,
+        context: ReaderSliderContext
+    ) {
+        store.send(
+            .sliderDragChanged(
+                SliderPreviewPositioning.pageIndex(
+                    at: locationX,
+                    sliderWidth: sliderWidth,
+                    horizontalPadding: context.horizontalPadding,
+                    sliderMaxIndex: context.maxIndex,
+                    isRightToLeft: context.isRightToLeft
+                )
+            )
+        )
+    }
 
     private func sliderPreviewBubbleLayout(readerSize: CGSize) -> SliderPreviewBubbleLayout {
         let aspectRatio: CGFloat = 248 / 176
@@ -1072,6 +1350,22 @@ struct ArchiveReader: View {
             rowHeight: imageHeight + 52
         )
     }
+}
+
+private struct ReaderSliderContext {
+    let displayValue: Double
+    let maxIndex: Int
+    let horizontalPadding: CGFloat
+    let isRightToLeft: Bool
+}
+
+private enum ReaderToolbarMetrics {
+    static let outerHorizontalPadding: CGFloat = 12
+    static let bottomPadding: CGFloat = 12
+    static let panelCornerRadius: CGFloat = 26
+    static let previewBottomSpacing: CGFloat = 12
+    static let sliderHorizontalPadding: CGFloat = 16
+    static let buttonSize: CGFloat = 44
 }
 
 enum SliderPreviewPositioning {
