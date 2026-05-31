@@ -2,6 +2,8 @@ import ComposableArchitecture
 import SwiftUI
 import UIKit
 
+// swiftlint:disable file_length
+
 public struct UIPageCollection: UIViewControllerRepresentable {
     let store: StoreOf<ArchiveReaderFeature>
     public init(store: StoreOf<ArchiveReaderFeature>) {
@@ -21,8 +23,17 @@ public struct UIPageCollection: UIViewControllerRepresentable {
 class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
     let store: StoreOf<ArchiveReaderFeature>
     var collectionView: UICollectionView!
-    var dataSource: UICollectionViewDiffableDataSource<Section, StoreOf<PageFeature>>!
+    var dataSource: UICollectionViewDiffableDataSource<Section, String>!
     private var lastReportedVisiblePageIndex: Int?
+    private var appliedPageIds: [String] = []
+    private var isApplyingSnapshot = false
+    private var activeAnimatedScrollTargetPageId: String?
+
+    private struct SnapshotAnchor {
+        let pageId: String
+        let offsetFromViewportOrigin: CGPoint
+        let resolvesAnimatedScroll: Bool
+    }
 
     // MARK: - Pull Navigation
     private enum PullEdge {
@@ -35,8 +46,9 @@ class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
     private var pullIndicatorContainer: UIView = UIView()
     private var pullArrowView: UIImageView = UIImageView()
     private var pullStatusLabel: UILabel = UILabel()
+    private var pullProgressView: UIProgressView = UIProgressView(progressViewStyle: .default)
     private var pullStatusBackground: UIVisualEffectView = UIVisualEffectView(
-        effect: UIBlurEffect(style: .systemMaterial)
+        effect: UIBlurEffect(style: .systemUltraThinMaterial)
     )
     private var lastReportedProgressBucket: Int = -1 // for throttled updates
     private var pullThresholdCrossedHapticsFired = false
@@ -123,20 +135,29 @@ class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
         )
 
         let cellRegistration = UICollectionView
-            .CellRegistration<UIPageCell, StoreOf<PageFeature>> { [weak self] cell, _, pageStore in
-                guard self != nil else { return }
+            .CellRegistration<UIPageCell, String> { [weak self] cell, _, pageId in
+                guard let self, let pageStore = self.pageStore(id: pageId) else { return }
                 cell.configure(with: pageStore)
             }
 
-        dataSource = UICollectionViewDiffableDataSource<Section, StoreOf<PageFeature>>(
+        dataSource = UICollectionViewDiffableDataSource<Section, String>(
             collectionView: collectionView
-        ) { collectionView, indexPath, pageStore in
+        ) { collectionView, indexPath, pageId in
             collectionView.dequeueConfiguredReusableCell(
                 using: cellRegistration,
                 for: indexPath,
-                item: pageStore
+                item: pageId
             )
         }
+    }
+
+    private func pageStore(id pageId: String) -> StoreOf<PageFeature>? {
+        Array(store.scope(state: \.pages, action: \.page)).first { $0.id == pageId }
+    }
+
+    private func pageStore(at indexPath: IndexPath) -> StoreOf<PageFeature>? {
+        guard let pageId = dataSource.itemIdentifier(for: indexPath) else { return nil }
+        return pageStore(id: pageId)
     }
 
     private var resolvedReadDirection: ReadDirection {
@@ -162,11 +183,15 @@ class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
             doublePageLayout: store.doublePageLayout
         )
         let indexPath = IndexPath(row: idx, section: 0)
+        collectionView.layoutIfNeeded()
+        guard let attr = collectionView.layoutAttributesForItem(at: indexPath) else {
+            return false
+        }
+        activeAnimatedScrollTargetPageId = request.animated ? dataSource.itemIdentifier(for: indexPath) : nil
+        if request.animated {
+            store.send(.collectionScrollStarted)
+        }
         if store.readDirection == ReadDirection.upDown.rawValue {
-            collectionView.layoutIfNeeded()
-            guard let attr = collectionView.layoutAttributesForItem(at: indexPath) else {
-                return false
-            }
             collectionView.scrollRectToVisible(attr.frame, animated: request.animated)
         } else {
             collectionView.scrollToItem(at: indexPath, at: scrollPosition(for: request), animated: request.animated)
@@ -187,14 +212,24 @@ class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
         observe { [weak self] in
             guard let self else { return }
             guard !store.pages.isEmpty else { return }
-            var snapshot = NSDiffableDataSourceSnapshot<
-                Section, StoreOf<PageFeature>
-            >()
+            let pageIds = store.pages.map(\.id)
+            guard pageIds != appliedPageIds else { return }
+            let snapshotAnchor = currentSnapshotAnchor()
+            appliedPageIds = pageIds
+
+            var snapshot = NSDiffableDataSourceSnapshot<Section, String>()
             snapshot.appendSections([.main])
-            snapshot.appendItems(
-                Array(store.scope(state: \.pages, action: \.page)))
-            dataSource.apply(snapshot, animatingDifferences: false) { [weak self] in
-                self?.consumePendingScrollRequestIfPossible()
+            snapshot.appendItems(pageIds)
+            isApplyingSnapshot = true
+            UIView.performWithoutAnimation {
+                dataSource.apply(snapshot, animatingDifferences: false) { [weak self] in
+                    guard let self else { return }
+                    self.restoreSnapshotAnchor(snapshotAnchor)
+                    self.consumePendingScrollRequestIfPossible()
+                    self.isApplyingSnapshot = false
+                }
+                collectionView.layoutIfNeeded()
+                restoreSnapshotAnchor(snapshotAnchor)
             }
         }
         observe { [weak self] in
@@ -259,6 +294,7 @@ class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
     }
 
     private func reportVisiblePageIfNeeded() {
+        guard !isApplyingSnapshot else { return }
         guard let visibleIndex = currentVisibleItemIndex() else { return }
         let pageIndex = ReaderPositioning.canonicalPageIndex(
             forVisibleIndex: visibleIndex,
@@ -301,6 +337,81 @@ class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
         return (deltaX * deltaX) + (deltaY * deltaY)
     }
 
+    private func currentSnapshotAnchor() -> SnapshotAnchor? {
+        if let activeAnimatedScrollTargetPageId,
+           store.pages.contains(where: { $0.id == activeAnimatedScrollTargetPageId }) {
+            return SnapshotAnchor(
+                pageId: activeAnimatedScrollTargetPageId,
+                offsetFromViewportOrigin: .zero,
+                resolvesAnimatedScroll: true
+            )
+        }
+
+        if let visibleIndex = currentVisibleItemIndex() {
+            let indexPath = IndexPath(row: visibleIndex, section: 0)
+            guard let pageId = dataSource.itemIdentifier(for: indexPath),
+                  let attributes = collectionView.layoutAttributesForItem(at: indexPath) else {
+                return nil
+            }
+
+            return SnapshotAnchor(
+                pageId: pageId,
+                offsetFromViewportOrigin: CGPoint(
+                    x: attributes.frame.minX - collectionView.contentOffset.x,
+                    y: attributes.frame.minY - collectionView.contentOffset.y
+                ),
+                resolvesAnimatedScroll: false
+            )
+        }
+
+        guard appliedPageIds.isEmpty else { return nil }
+        let anchorIndex = ReaderPositioning.scrollAnchorIndex(
+            forPageIndex: store.currentPageIndex,
+            pageCount: store.pages.count,
+            readDirection: resolvedReadDirection,
+            doublePageLayout: store.doublePageLayout
+        )
+        guard store.pages.indices.contains(anchorIndex) else { return nil }
+        return SnapshotAnchor(
+            pageId: store.pages[anchorIndex].id,
+            offsetFromViewportOrigin: .zero,
+            resolvesAnimatedScroll: false
+        )
+    }
+
+    private func restoreSnapshotAnchor(_ anchor: SnapshotAnchor?) {
+        guard let anchor,
+              let pageIndex = store.pages.firstIndex(where: { $0.id == anchor.pageId }) else {
+            return
+        }
+
+        collectionView.layoutIfNeeded()
+        let indexPath = IndexPath(row: pageIndex, section: 0)
+        guard let attributes = collectionView.layoutAttributesForItem(at: indexPath) else { return }
+
+        let proposedOffset = CGPoint(
+            x: attributes.frame.minX - anchor.offsetFromViewportOrigin.x,
+            y: attributes.frame.minY - anchor.offsetFromViewportOrigin.y
+        )
+        collectionView.setContentOffset(clampedContentOffset(proposedOffset), animated: false)
+        if anchor.resolvesAnimatedScroll {
+            activeAnimatedScrollTargetPageId = nil
+        }
+    }
+
+    private func clampedContentOffset(_ offset: CGPoint) -> CGPoint {
+        let inset = collectionView.adjustedContentInset
+        let minimumX = -inset.left
+        let minimumY = -inset.top
+        let maximumX = max(minimumX, collectionView.contentSize.width - collectionView.bounds.width + inset.right)
+        let maximumY = max(minimumY, collectionView.contentSize.height - collectionView.bounds.height + inset.bottom)
+
+        return CGPoint(
+            x: min(max(offset.x, minimumX), maximumX),
+            y: min(max(offset.y, minimumY), maximumY)
+        )
+    }
+
     // Returns index path representing the start of the current visual page (accounts for double page layout)
     private func currentVisualPageIndexPath() -> IndexPath? {
         guard let visibleIndex = currentVisibleItemIndex() else { return nil }
@@ -309,7 +420,8 @@ class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
 
     // For double page layout treat a pair of items as one visual page; return left item index path
     private func startOfGroupIndexPath(for indexPath: IndexPath) -> IndexPath {
-        guard store.readDirection != ReadDirection.upDown.rawValue && store.doublePageLayout else { return indexPath }
+        guard store.readDirection != ReadDirection.upDown.rawValue,
+              store.doublePageLayout else { return indexPath }
         let row = indexPath.row % 2 == 0 ? indexPath.row : indexPath.row - 1
         return IndexPath(row: row, section: indexPath.section)
     }
@@ -438,28 +550,38 @@ extension UIPageCollectionController: UIGestureRecognizerDelegate {
 // MARK: - Pull Navigation UI Logic
 extension UIPageCollectionController {
     private func setupPullNavigationUI() {
-        // Arrow container (initially hidden)
-        pullIndicatorContainer.isHidden = true
-        pullIndicatorContainer.clipsToBounds = false
-        view.addSubview(pullIndicatorContainer)
+        pullStatusBackground.isHidden = true
+        pullStatusBackground.clipsToBounds = true
+        pullStatusBackground.layer.cornerRadius = 24
+        pullStatusBackground.layer.cornerCurve = .continuous
+        pullStatusBackground.layer.borderWidth = 1
+        pullStatusBackground.layer.borderColor = UIColor.separator.withAlphaComponent(0.16).cgColor
+        view.addSubview(pullStatusBackground)
+
+        pullIndicatorContainer.clipsToBounds = true
+        pullIndicatorContainer.layer.cornerRadius = 18
+        pullIndicatorContainer.layer.cornerCurve = .continuous
+        pullIndicatorContainer.backgroundColor = UIColor.secondarySystemFill
+        pullStatusBackground.contentView.addSubview(pullIndicatorContainer)
 
         pullArrowView.contentMode = .scaleAspectFit
         pullArrowView.tintColor = .secondaryLabel
+        pullArrowView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
         pullIndicatorContainer.addSubview(pullArrowView)
 
-        pullStatusLabel.font = UIFont.preferredFont(forTextStyle: .headline)
+        pullStatusLabel.font = UIFont.preferredFont(forTextStyle: .subheadline)
+        pullStatusLabel.adjustsFontForContentSizeCategory = true
         pullStatusLabel.textColor = .label
-        pullStatusLabel.textAlignment = .center
+        pullStatusLabel.textAlignment = .natural
         pullStatusLabel.numberOfLines = 1
         pullStatusLabel.isHidden = true
-
-        pullStatusBackground.isHidden = true
-        pullStatusBackground.clipsToBounds = true
-        pullStatusBackground.layer.cornerRadius = 14
-        pullStatusBackground.layer.cornerCurve = .continuous
-        // Add label inside contentView
         pullStatusBackground.contentView.addSubview(pullStatusLabel)
-        view.addSubview(pullStatusBackground)
+
+        pullProgressView.trackTintColor = UIColor.separator.withAlphaComponent(0.14)
+        pullProgressView.progressTintColor = .systemBlue
+        pullProgressView.layer.cornerRadius = 1.5
+        pullProgressView.clipsToBounds = true
+        pullStatusBackground.contentView.addSubview(pullProgressView)
     }
 
     private func isAtFirstVisualPage() -> Bool {
@@ -540,92 +662,98 @@ extension UIPageCollectionController {
         let bucket = Int(pullProgress * 20) // 0..20
         guard bucket != lastReportedProgressBucket else { return }
         lastReportedProgressBucket = bucket
-        layoutPullIndicator(overscroll: overscroll, axis: metrics.axis)
-        updatePullViews()
+        updatePullViews(overscroll: overscroll, axis: metrics.axis)
     }
 
-    // swiftlint:disable function_body_length
     private func layoutPullIndicator(overscroll: CGFloat, axis: NSLayoutConstraint.Axis) {
         guard let edge = pullEdge else { return }
-        let maxVisualWidth: CGFloat = min(overscroll, pullThreshold * 1.25)
-        let arrowSize: CGFloat = 32
+        let iconSize: CGFloat = 36
+        let cardHeight: CGFloat = 52
+        let horizontalPadding: CGFloat = 12
+        let spacing: CGFloat = 10
+        let cardWidth = pullCardWidth(
+            iconSize: iconSize,
+            horizontalPadding: horizontalPadding,
+            spacing: spacing
+        )
+        let progress = min(1, overscroll / pullThreshold)
+        let edgeInset = 16 + progress * 14
+        pullStatusBackground.frame = pullCardFrame(
+            edge: edge,
+            axis: axis,
+            cardWidth: cardWidth,
+            cardHeight: cardHeight,
+            edgeInset: edgeInset
+        )
+        pullStatusBackground.layer.cornerRadius = cardHeight / 2
+        layoutPullCardContent(
+            cardWidth: cardWidth,
+            cardHeight: cardHeight,
+            iconSize: iconSize,
+            horizontalPadding: horizontalPadding,
+            spacing: spacing
+        )
+    }
 
+    private func pullCardWidth(iconSize: CGFloat, horizontalPadding: CGFloat, spacing: CGFloat) -> CGFloat {
+        let maxWidth = max(min(view.bounds.width - 32, 360), 0)
+        pullStatusLabel.sizeToFit()
+        let labelAvailableWidth = max(maxWidth - iconSize - spacing - horizontalPadding * 2, 0)
+        let labelWidth = min(
+            labelAvailableWidth,
+            pullStatusLabel.bounds.width
+        )
+        let minimumWidth = min(172, maxWidth)
+        return min(maxWidth, max(minimumWidth, iconSize + spacing + labelWidth + horizontalPadding * 2))
+    }
+
+    private func pullCardFrame(
+        edge: PullEdge,
+        axis: NSLayoutConstraint.Axis,
+        cardWidth: CGFloat,
+        cardHeight: CGFloat,
+        edgeInset: CGFloat
+    ) -> CGRect {
         if axis == .horizontal {
             let isRTLReading = store.readDirection == ReadDirection.rightLeft.rawValue
-            let containerFrame: CGRect
-            if isRTLReading {
-                switch edge {
-                case .previous:
-                    containerFrame = CGRect(
-                        x: view.bounds.width - maxVisualWidth,
-                        y: 0,
-                        width: maxVisualWidth,
-                        height: view.bounds.height
-                    )
-                case .next:
-                    containerFrame = CGRect(x: 0, y: 0, width: maxVisualWidth, height: view.bounds.height)
-                }
-            } else {
-                switch edge {
-                case .previous:
-                    containerFrame = CGRect(x: 0, y: 0, width: maxVisualWidth, height: view.bounds.height)
-                case .next:
-                    containerFrame = CGRect(
-                        x: view.bounds.width - maxVisualWidth,
-                        y: 0,
-                        width: maxVisualWidth,
-                        height: view.bounds.height
-                    )
-                }
-            }
-            pullIndicatorContainer.frame = containerFrame
-            pullArrowView.frame = CGRect(
-                x: (containerFrame.width - arrowSize) / 2,
-                y: (containerFrame.height - arrowSize) / 2,
-                width: arrowSize,
-                height: arrowSize
-            )
-        } else {
-            let containerFrame: CGRect
-            switch edge {
-            case .previous:
-                containerFrame = CGRect(x: 0, y: 0, width: view.bounds.width, height: maxVisualWidth)
-            case .next:
-                containerFrame = CGRect(
-                    x: 0,
-                    y: view.bounds.height - maxVisualWidth,
-                    width: view.bounds.width,
-                    height: maxVisualWidth
-                )
-            }
-            pullIndicatorContainer.frame = containerFrame
-            pullArrowView.frame = CGRect(
-                x: (containerFrame.width - arrowSize) / 2,
-                y: (containerFrame.height - arrowSize) / 2,
-                width: arrowSize,
-                height: arrowSize
-            )
+            let showOnLeft = (edge == .previous && !isRTLReading) || (edge == .next && isRTLReading)
+            let xPosition = showOnLeft ? edgeInset : view.bounds.width - cardWidth - edgeInset
+            return CGRect(x: xPosition, y: view.bounds.midY - cardHeight / 2, width: cardWidth, height: cardHeight)
         }
-    }
-    // swiftlint:enable function_body_length
 
-    private func layoutStatusLabel() {
-        let maxWidth = min(view.bounds.width * 0.7, 360)
-        pullStatusLabel.sizeToFit()
-        let intrinsic = pullStatusLabel.bounds.size
-        let paddedWidth = min(maxWidth, intrinsic.width + 32)
-        let height: CGFloat = max(40, intrinsic.height + 16)
-        pullStatusBackground.frame = CGRect(
-            x: (view.bounds.width - paddedWidth)/2,
-            y: view.bounds.midY - height/2,
-            width: paddedWidth,
-            height: height
+        let safeArea = view.safeAreaInsets
+        let yPosition = edge == .previous
+            ? safeArea.top + edgeInset
+            : view.bounds.height - safeArea.bottom - cardHeight - edgeInset
+        return CGRect(x: (view.bounds.width - cardWidth) / 2, y: yPosition, width: cardWidth, height: cardHeight)
+    }
+
+    private func layoutPullCardContent(
+        cardWidth: CGFloat,
+        cardHeight: CGFloat,
+        iconSize: CGFloat,
+        horizontalPadding: CGFloat,
+        spacing: CGFloat
+    ) {
+        pullIndicatorContainer.frame = CGRect(
+            x: horizontalPadding,
+            y: (cardHeight - iconSize) / 2,
+            width: iconSize,
+            height: iconSize
         )
+        pullArrowView.frame = pullIndicatorContainer.bounds.insetBy(dx: 8, dy: 8)
+        let labelX = horizontalPadding + iconSize + spacing
         pullStatusLabel.frame = CGRect(
-            x: 0,
-            y: (height - pullStatusLabel.font.lineHeight)/2 - 1,
-            width: paddedWidth,
+            x: labelX,
+            y: (cardHeight - pullStatusLabel.font.lineHeight) / 2 - 1,
+            width: cardWidth - labelX - horizontalPadding,
             height: pullStatusLabel.font.lineHeight + 2
+        )
+        pullProgressView.frame = CGRect(
+            x: horizontalPadding + 2,
+            y: cardHeight - 5,
+            width: cardWidth - (horizontalPadding + 2) * 2,
+            height: 3
         )
     }
 
@@ -661,14 +789,14 @@ extension UIPageCollectionController {
         return store.currentArchiveId == last.wrappedValue.id
     }
 
-    private func updatePullViews() {
-        guard pullActive, let edge = pullEdge, let metrics = currentScrollMetrics() else { return }
+    private func updatePullViews(overscroll: CGFloat, axis: NSLayoutConstraint.Axis) {
+        guard pullActive, let edge = pullEdge else { return }
         pullIndicatorContainer.isHidden = false
         pullStatusBackground.isHidden = false
         pullStatusLabel.isHidden = false
         let atArchiveBoundary = (edge == .previous && isAtFirstArchive()) || (edge == .next && isAtLastArchive())
         let flipped = !atArchiveBoundary && pullProgress >= 1
-        pullArrowView.image = UIImage(systemName: symbolName(for: edge, axis: metrics.axis, flipped: flipped))
+        pullArrowView.image = UIImage(systemName: symbolName(for: edge, axis: axis, flipped: flipped))
 
         if atArchiveBoundary {
             if edge == .previous {
@@ -684,7 +812,8 @@ extension UIPageCollectionController {
             case .next: pullStatusLabel.text = String(localized: "archive.read.next")
             }
         }
-        layoutStatusLabel()
+        layoutPullIndicator(overscroll: overscroll, axis: axis)
+        updatePullStyle(atArchiveBoundary: atArchiveBoundary, releaseReady: flipped)
         if flipped && !pullThresholdCrossedHapticsFired {
             let generator = UIImpactFeedbackGenerator(style: .medium)
             generator.prepare()
@@ -697,6 +826,26 @@ extension UIPageCollectionController {
         pullArrowView.alpha = alpha
         pullStatusLabel.alpha = alpha
         pullStatusBackground.alpha = alpha
+        pullStatusBackground.transform = CGAffineTransform(
+            scaleX: 0.96 + pullProgress * 0.04,
+            y: 0.96 + pullProgress * 0.04
+        )
+    }
+
+    private func updatePullStyle(atArchiveBoundary: Bool, releaseReady: Bool) {
+        let tintColor: UIColor = if atArchiveBoundary {
+            .tertiaryLabel
+        } else if releaseReady {
+            .systemBlue
+        } else {
+            .secondaryLabel
+        }
+        pullArrowView.tintColor = tintColor
+        pullStatusLabel.textColor = atArchiveBoundary ? .secondaryLabel : .label
+        pullIndicatorContainer.backgroundColor = tintColor.withAlphaComponent(releaseReady ? 0.18 : 0.10)
+        pullStatusBackground.layer.borderColor = tintColor.withAlphaComponent(releaseReady ? 0.34 : 0.14).cgColor
+        pullProgressView.progressTintColor = tintColor
+        pullProgressView.setProgress(Float(pullProgress), animated: false)
     }
 
     private func endPullInteraction() {
@@ -707,6 +856,8 @@ extension UIPageCollectionController {
         pullIndicatorContainer.isHidden = true
         pullStatusLabel.isHidden = true
         pullStatusBackground.isHidden = true
+        pullStatusBackground.transform = .identity
+        pullProgressView.setProgress(0, animated: false)
         pullThresholdCrossedHapticsFired = false
     }
 
@@ -721,11 +872,19 @@ extension UIPageCollectionController {
 
     func resetCollectionView() {
         let snapshot = NSDiffableDataSourceSnapshot<
-            Section, StoreOf<PageFeature>
+            Section, String
         >()
+        appliedPageIds = []
+        activeAnimatedScrollTargetPageId = nil
         dataSource.apply(snapshot, animatingDifferences: false)
         collectionView.setContentOffset(.zero, animated: false)
         lastReportedVisiblePageIndex = nil
+    }
+
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        guard scrollView === collectionView else { return }
+        activeAnimatedScrollTargetPageId = nil
+        store.send(.collectionScrollStarted)
     }
 
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
@@ -748,17 +907,20 @@ extension UIPageCollectionController {
 
         endPullInteraction()
         if !decelerate {
+            store.send(.collectionScrollEnded)
             reportVisiblePageIfNeeded()
         }
     }
 
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
         guard scrollView === collectionView else { return }
+        store.send(.collectionScrollEnded)
         reportVisiblePageIfNeeded()
     }
 
     func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
         guard scrollView === collectionView else { return }
+        store.send(.collectionScrollEnded)
         reportVisiblePageIfNeeded()
     }
 }
@@ -783,7 +945,7 @@ extension UIPageCollectionController: UICollectionViewDataSourcePrefetching {
         prefetchItemsAt indexPaths: [IndexPath]
     ) {
         indexPaths.forEach { path in
-            if let pageStore = dataSource.itemIdentifier(for: path) {
+            if let pageStore = pageStore(at: path) {
                 if pageStore.pageMode == .loading {
                     Task {
                         await pageStore.send(.load(false)).finish()

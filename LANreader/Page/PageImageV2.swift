@@ -9,7 +9,6 @@ import Logging
     @ObservableState
     public struct State: Equatable, Identifiable, Sendable {
         @SharedReader(.appStorage(SettingsKey.splitWideImage)) var splitImage = false
-        @SharedReader(.appStorage(SettingsKey.splitPiorityLeft)) var piorityLeft = false
         @SharedReader(.appStorage(SettingsKey.translationEnabled)) var translationEnabled = false
 
         let pageId: String
@@ -19,6 +18,7 @@ import Logging
         var progress: Double = 0
         var errorMessage = ""
         var pageMode: PageMode
+        var pendingSplitMode: PageMode?
         let cached: Bool
         var imageLoaded = false
         var translationStatus = ""
@@ -33,7 +33,7 @@ import Logging
             self.pageId = pageId
             self.pageNumber = pageNumber
             self.pageMode = pageMode
-            self.suffix = pageMode.rawValue
+            self.suffix = pageMode.identitySuffix
             self.cached = cached
             let imagePath = if cached {
                 LANraragiService.cachePath
@@ -50,9 +50,9 @@ import Logging
         case subscribeToProgress(DownloadRequest)
         case cancelSubscribeImageProgress
         case setProgress(Double)
-        case setImage(PageMode, Bool)
+        case setStoredImage(shouldDisplayAsSplitPages: Bool)
+        case storedImageResolved(shouldDisplayAsSplitPages: Bool)
         case setError(String)
-        case insertPage(PageMode)
         case setTranslationStatus(String)
     }
 
@@ -60,7 +60,10 @@ import Logging
     @Dependency(\.imageService) var imageService
     @Dependency(\.translatorService) var translatorService
 
-    public enum CancelId: Sendable { case imageProgress }
+    public enum CancelId: Sendable {
+        case imageLoad
+        case imageProgress
+    }
 
     public var body: some ReducerOf<Self> {
         Reduce { state, action in
@@ -83,43 +86,31 @@ import Logging
                 guard !state.loading || force else {
                     return .none
                 }
+                if !force, state.pageMode != .loading {
+                    state.loading = false
+                    state.imageLoaded = true
+                    return .none
+                }
+
                 state.loading = true
                 state.errorMessage = ""
                 state.imageLoaded = false
 
-                let previousPageMode = state.pageMode
-
                 if force {
                     state.pageMode = .loading
                 } else if state.pageMode == .loading {
-                    let leftPath = imageService.storedImagePath(
-                        folderUrl: state.folder,
-                        pageNumber: "\(state.pageNumber)-left"
-                    )
-                    let rightPath = imageService.storedImagePath(
-                        folderUrl: state.folder,
-                        pageNumber: "\(state.pageNumber)-right"
-                    )
                     let normalPath = imageService.storedImagePath(
                         folderUrl: state.folder,
                         pageNumber: String(state.pageNumber)
                     )
 
-                    if state.splitImage {
-                        if state.piorityLeft && leftPath != nil {
-                            state.pageMode = .left
-                            state.imageLoaded = true
-                            return .send(.insertPage(.right))
-                        } else if rightPath != nil {
-                            state.pageMode = .right
-                            state.imageLoaded = true
-                            return .send(.insertPage(.left))
-                        }
-                    }
-                    if normalPath != nil {
-                        state.pageMode = .normal
-                        state.imageLoaded = true
-                        return .none
+                    if let normalPath {
+                        let shouldDisplayAsSplitPages = state.splitImage
+                            && imageService.shouldSplitWideImage(imageUrl: normalPath)
+                        return applyStoredImage(
+                            shouldDisplayAsSplitPages: shouldDisplayAsSplitPages,
+                            state: &state
+                        )
                     }
                 } else {
                     state.loading = false
@@ -132,6 +123,8 @@ import Logging
                         return .send(.setError(String(localized: "archive.cache.page.load.failed")))
                     } else {
                         return .run { [state] send in
+                            await send(.cancelSubscribeImageProgress)
+
                             do {
                                 let task = await service.fetchArchivePage(
                                     page: state.pageId,
@@ -189,19 +182,27 @@ import Logging
                                     }
                                 }
 
-                                let splitted = imageService.resizeImage(
+                                let storedPageImage = imageService.storePageImage(
                                     imageUrl: imageUrl,
                                     imageData: translated,
                                     destinationUrl: state.folder!,
                                     pageNumber: String(state.pageNumber),
-                                    split: state.splitImage
+                                    splitWideImages: state.splitImage
                                 )
-                                await send(.setImage(previousPageMode, splitted))
+                                await send(
+                                    .setStoredImage(
+                                        shouldDisplayAsSplitPages: storedPageImage?.shouldDisplayAsSplitPages ?? false
+                                    )
+                                )
+                            } catch is CancellationError {
+                                await send(.cancelSubscribeImageProgress)
                             } catch {
                                 logger.error("failed to load image. \(error)")
+                                await send(.cancelSubscribeImageProgress)
                                 await send(.setError(error.localizedDescription))
                             }
                         }
+                        .cancellable(id: CancelId.imageLoad, cancelInFlight: true)
                     }
                 }
                 state.loading = false
@@ -213,38 +214,41 @@ import Logging
             case let .setProgress(progres):
                 state.progress = progres
                 return .none
-            case let .setImage(previousPageMode, splitted):
-                state.progress = 0
-                state.loading = false
-                state.imageLoaded = true
-                if splitted {
-                    if previousPageMode == .left || previousPageMode == .right {
-                        state.pageMode = previousPageMode
-                        return .none
-                    }
-                    if state.piorityLeft {
-                        state.pageMode = .left
-                        return .send(.insertPage(.right))
-                    } else {
-                        state.pageMode = .right
-                        return .send(.insertPage(.left))
-                    }
-                } else {
-                    state.pageMode = .normal
-                }
-                return .none
+            case let .setStoredImage(shouldDisplayAsSplitPages):
+                return applyStoredImage(
+                    shouldDisplayAsSplitPages: shouldDisplayAsSplitPages,
+                    state: &state
+                )
             case let .setError(message):
                 state.loading = false
                 state.imageLoaded = true
                 state.errorMessage = message
+                state.pendingSplitMode = nil
                 return .none
-            case .insertPage:
+            case .storedImageResolved:
                 return .none
             case let .setTranslationStatus(status):
                 state.translationStatus = status
                 return .none
             }
         }
+    }
+
+    private func applyStoredImage(
+        shouldDisplayAsSplitPages: Bool,
+        state: inout State
+    ) -> Effect<Action> {
+        state.progress = 0
+        state.loading = false
+        state.imageLoaded = true
+
+        if shouldDisplayAsSplitPages {
+            return .send(.storedImageResolved(shouldDisplayAsSplitPages: true))
+        }
+
+        state.pageMode = .normal
+        state.pendingSplitMode = nil
+        return .send(.storedImageResolved(shouldDisplayAsSplitPages: false))
     }
 }
 
@@ -254,4 +258,38 @@ public enum PageMode: String, Sendable {
     case right
     case normal
     case error
+}
+
+extension PageMode {
+    var identitySuffix: String {
+        switch self {
+        case .loading:
+            PageMode.normal.rawValue
+        case .left, .right, .normal, .error:
+            rawValue
+        }
+    }
+
+    var isSplitMode: Bool {
+        self == .left || self == .right
+    }
+
+    var splitSiblingMode: PageMode? {
+        switch self {
+        case .left:
+            return .right
+        case .right:
+            return .left
+        case .loading, .normal, .error:
+            return nil
+        }
+    }
+
+    static func preferredSplitMode(priorityLeft: Bool) -> PageMode {
+        priorityLeft ? .left : .right
+    }
+
+    static func trailingSplitMode(priorityLeft: Bool) -> PageMode {
+        priorityLeft ? .right : .left
+    }
 }
