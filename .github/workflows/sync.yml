@@ -49,7 +49,7 @@ jobs:
         id: check_branch
         run: |
           output=$(git ls-remote --heads origin refs/heads/sync_upstream | wc -l)
-          if [output = "1"]; then
+          if [ "$output" = "1" ]; then
             echo "sync_upstream branch exists"
           else
             echo "sync_upstream branch does not exist"
