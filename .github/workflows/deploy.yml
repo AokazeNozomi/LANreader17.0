@@ -25,13 +25,17 @@ jobs:
   Deploy:
     runs-on: macos-26
     if: |
-      github.event_name == 'workflow_dispatch' || (github.event.pull_request.merged == true && github.event.pull_request.user.login == 'AokazeNozomi')
+      github.event_name == 'workflow_dispatch' || (
+        github.event.pull_request.merged == true &&
+        !startsWith(github.event.pull_request.head.ref, 'deploy/')
+      )
     steps:
       - name: Checkout code from ref
-        uses: actions/checkout@v2
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: ${{ github.ref }}
+          token: ${{ secrets.PAT }}
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.4"
@@ -122,12 +126,6 @@ jobs:
           body: "https://github.com/Doraemoe/LANreader/releases/tag/${{ steps.latest.outputs.tag }}"
           name: "v${{ steps.bump-version.outputs.version }}"
           tag_name: "v${{ steps.bump-version.outputs.version }}"
-      - name: Commit bump version
-        run: |
-          git add .
-          git commit -m "Bump version"
-          git pull --rebase origin master
-          git push origin HEAD
       - name: Update AltStore.json
         env:
           UPSTREAM_RELEASE_URL: "https://github.com/Doraemoe/LANreader/releases/tag/${{ steps.latest.outputs.tag }}"
@@ -138,12 +136,26 @@ jobs:
           echo "`jq '.apps[0].versions[0].version="${{ steps.bump-version.outputs.version }}"' $ALTSTORE_JSON_PATH`" > $ALTSTORE_JSON_PATH
           echo "`jq '.apps[0].versions[0].minOSVersion="17.0"' $ALTSTORE_JSON_PATH`" > $ALTSTORE_JSON_PATH
           echo "`jq '.apps[0].versions[0].downloadURL="https://github.com/AokazeNozomi/LANreader17.0/releases/download/v${{ steps.bump-version.outputs.version }}/LANreader.ipa"' $ALTSTORE_JSON_PATH`" > $ALTSTORE_JSON_PATH
-      - name: Commit update AltStore.json
+      - name: Create pull request for release metadata
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.PAT }}
+          commit-message: "Bump version and update AltStore.json"
+          title: "Release v${{ steps.bump-version.outputs.version }}"
+          body: |
+            Post-release metadata update from deploy workflow.
+            Upstream: https://github.com/Doraemoe/LANreader/releases/tag/${{ steps.latest.outputs.tag }}
+          branch: deploy/v${{ steps.bump-version.outputs.version }}
+          base: master
+          delete-branch: true
+      - name: Enable auto-merge on pull request
         run: |
-          git add .
-          git commit -m "Update AltStore.json"
-          git pull --rebase origin master
-          git push origin HEAD
+          pr_number=$(gh pr list --head "${{ github.repository_owner }}:deploy/v${{ steps.bump-version.outputs.version }}" --json number -q '.[0].number')
+          if [ -n "$pr_number" ] && [ "$pr_number" != "null" ]; then
+            gh pr merge "$pr_number" --auto --merge --repo "${{ github.repository }}"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
 
 #      - name: Post release notes
 #        run: |
