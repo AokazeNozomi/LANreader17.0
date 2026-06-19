@@ -137,6 +137,7 @@ jobs:
           echo "`jq '.apps[0].versions[0].minOSVersion="17.0"' $ALTSTORE_JSON_PATH`" > $ALTSTORE_JSON_PATH
           echo "`jq '.apps[0].versions[0].downloadURL="https://github.com/AokazeNozomi/LANreader17.0/releases/download/v${{ steps.bump-version.outputs.version }}/LANreader.ipa"' $ALTSTORE_JSON_PATH`" > $ALTSTORE_JSON_PATH
       - name: Create pull request for release metadata
+        id: create-pr
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.PAT }}
@@ -149,13 +150,12 @@ jobs:
           base: master
           delete-branch: true
       - name: Enable auto-merge on pull request
+        if: steps.create-pr.outputs.pull-request-number != ''
         run: |
-          pr_number=$(gh pr list --head "${{ github.repository_owner }}:deploy/v${{ steps.bump-version.outputs.version }}" --json number -q '.[0].number')
-          if [ -n "$pr_number" ] && [ "$pr_number" != "null" ]; then
-            gh pr merge "$pr_number" --auto --merge --repo "${{ github.repository }}"
-          fi
+          gh pr merge "${{ steps.create-pr.outputs.pull-request-number }}" --auto --merge --repo "${{ github.repository }}"
         env:
           GH_TOKEN: ${{ secrets.PAT }}
+        shell: bash
 
 #      - name: Post release notes
 #        run: |
