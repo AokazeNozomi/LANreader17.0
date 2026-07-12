@@ -202,6 +202,22 @@ class LANraragiServiceTest: XCTestCase {
         XCTAssertNil(actual)
     }
 
+    func testUpdateArchiveThumbnailSendsPageAsQueryParameter() async throws {
+        try await configureVerifiedClient()
+
+        let body = "{ \"operation\": \"update_thumbnail\", \"success\": 1 }"
+        stub(condition: isHost("localhost")
+                && isPath("/api/archives/id/thumbnail")
+                && containsQueryParams(["page": "4"])
+                && isMethodPUT()
+                && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")) { _ in
+            HTTPStubsResponse(data: Data(body.utf8), statusCode: 200, headers: ["Content-Type": "application/json"])
+        }
+
+        let actual = try await service.updateArchiveThumbnail(id: "id", page: 4).value
+        XCTAssertEqual(actual, body)
+    }
+
     func testQueuePageThumbnailsReturnsQueuedJob() async throws {
         try await configureVerifiedClient()
 
@@ -256,6 +272,37 @@ class LANraragiServiceTest: XCTestCase {
         XCTAssertEqual(actual.message, "No job queued, all thumbnails already exist.")
         XCTAssertEqual(actual.operation, "generate_page_thumbnails")
         XCTAssertEqual(actual.success, "1")
+    }
+
+    func testQueueUrlDownloadSendsUrlAsQueryParameter() async throws {
+        try await configureVerifiedClient()
+
+        let downloadUrl = "https://example.com/archive.zip"
+        let body = Data("""
+        {
+          "job": 86,
+          "operation": "download_url",
+          "success": 1,
+          "url": "\(downloadUrl)"
+        }
+        """.utf8)
+        stub(condition: isHost("localhost")
+                && isPath("/api/download_url")
+                && containsQueryParams(["url": downloadUrl])
+                && isMethodPOST()
+                && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")) { _ in
+            HTTPStubsResponse(
+                data: body,
+                statusCode: 200,
+                headers: ["Content-Type": "application/json"]
+            )
+        }
+
+        let actual = try await service.queueUrlDownload(downloadUrl: downloadUrl).value
+        XCTAssertEqual(actual.job, 86)
+        XCTAssertEqual(actual.operation, "download_url")
+        XCTAssertEqual(actual.success, 1)
+        XCTAssertEqual(actual.url, downloadUrl)
     }
 
     func testSearchArchive() async throws {
@@ -626,8 +673,8 @@ class LANraragiServiceTest: XCTestCase {
 
         stub(condition: isHost("localhost")
                 && isPath("/api/archives/id/metadata")
+                && containsQueryParams(["tags": "tags", "title": "name"])
                 && isMethodPUT()
-                && hasBody(Data("tags=tags&title=name".utf8))
                 && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")) { _ in
             HTTPStubsResponse(
                     fileAtPath: OHPathForFile("SetArchiveMetadataResponse.json", type(of: self))!,
@@ -647,8 +694,8 @@ class LANraragiServiceTest: XCTestCase {
 
         stub(condition: isHost("localhost")
                 && isPath("/api/archives/id/metadata")
+                && containsQueryParams(["tags": "tags", "title": "name"])
                 && isMethodPUT()
-                && hasBody(Data("tags=tags&title=name".utf8))
                 && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")) { _ in
             HTTPStubsResponse(
                     fileAtPath: OHPathForFile("UnauthorizedResponse.json", type(of: self))!,
