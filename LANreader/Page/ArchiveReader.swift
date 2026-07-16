@@ -109,6 +109,13 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
             archivePageNumbers.count
         }
 
+        var chapters: [ArchiveChapter] {
+            guard let currentArchive = allArchives[id: currentArchiveId] else {
+                return []
+            }
+            return currentArchive.wrappedValue.toc ?? []
+        }
+
         var canOpenDetails: Bool {
             guard !extracting else { return false }
             guard currentArchiveId.isTankoubonArchiveId else { return true }
@@ -130,6 +137,7 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
         case finishExtracting([ReaderExtractedPage], TankoubonDetailsMetadata?)
         case toggleControlUi(Bool?)
         case visiblePageChanged(Int)
+        case chapterSelected(Int)
         case requestJump(Int, source: ReaderNavigationSource)
         case navigate(ReaderNavigationDirection, source: ReaderNavigationSource)
         case scrollRequestHandled(UUID)
@@ -235,9 +243,14 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                     var tankoubonDetails: TankoubonDetailsMetadata?
                     if id.isTankoubonArchiveId {
                         let tankoubon = try await service.retrieveFullTankoubon(id: id).value
-                        tankoubonDetails = TankoubonDetailsMetadata(response: tankoubon)
+                        var details = TankoubonDetailsMetadata(response: tankoubon)
                         let archiveIds = Self.tankoubonArchiveIds(from: tankoubon)
+                        let archiveMetadata = Dictionary(
+                            (tankoubon.result.fullData ?? []).map { ($0.arcid, $0) },
+                            uniquingKeysWith: { first, _ in first }
+                        )
                         var tankPages: [ReaderExtractedPage] = []
+                        var tankChapters: [ArchiveChapter] = []
 
                         if archiveIds.isEmpty {
                             logger.error("tankoubon returned no archives. id=\(id)")
@@ -248,10 +261,21 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                             if extractResponse.pages.isEmpty {
                                 logger.error("server returned empty pages. id=\(archiveId)")
                             }
-                            tankPages.append(
-                                contentsOf: Self.extractedPages(from: extractResponse.pages, archiveId: archiveId)
+                            let extractedPages = Self.extractedPages(
+                                from: extractResponse.pages,
+                                archiveId: archiveId
                             )
+                            tankChapters.append(
+                                contentsOf: Self.tankoubonChapters(
+                                    from: archiveMetadata[archiveId],
+                                    pageOffset: tankPages.count,
+                                    extractedPageCount: extractedPages.count
+                                )
+                            )
+                            tankPages.append(contentsOf: extractedPages)
                         }
+                        details.toc = tankChapters.isEmpty ? nil : tankChapters
+                        tankoubonDetails = details
                         pages = tankPages
                     } else {
                         let extractResponse = try await service.extractArchive(id: id).value
@@ -284,6 +308,11 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                     }
                     state.pages.append(contentsOf: pageState)
                     guard let currentArchive = state.allArchives[id: state.currentArchiveId] else { return .none }
+                    if state.currentArchiveId.isTankoubonArchiveId {
+                        currentArchive.withLock {
+                            $0.toc = tankoubonDetails?.toc
+                        }
+                    }
                     let pageIndexToShow = ReaderPositioning.initialPageIndex(
                         progress: currentArchive.wrappedValue.progress,
                         pageCount: state.pages.count,
@@ -351,6 +380,11 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                     logger.error("failed to update archive progress. id=\(state.currentArchiveId) \(error)")
                 }
                 .cancellable(id: CancelId.updateProgress, cancelInFlight: true)
+            case let .chapterSelected(pageNumber):
+                guard let pageIndex = state.pages.firstIndex(where: { $0.pageNumber == pageNumber }) else {
+                    return .none
+                }
+                return .send(.requestJump(pageIndex, source: .chapter))
             case let .requestJump(index, source):
                 guard !state.pages.isEmpty else { return .none }
                 let clampedIndex = ReaderPositioning.clampedPageIndex(index, pageCount: state.pages.count)
@@ -358,7 +392,7 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                     id: uuid(),
                     targetPageIndex: clampedIndex,
                     source: source,
-                    animated: source != .slider && source != .initialRestore
+                    animated: source != .slider && source != .initialRestore && source != .chapter
                 )
                 return .none
             case .collectionScrollStarted:
@@ -738,13 +772,15 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                         requested.append(page.pageId)
                     }
                     guard let currentArchive = state.allArchives[id: state.currentArchiveId] else { return }
+                    let archive = currentArchive.wrappedValue
                     var cache = ArchiveCache(
                         id: state.currentArchiveId,
-                        title: currentArchive.wrappedValue.name,
-                        tags: currentArchive.wrappedValue.tags,
+                        title: archive.name,
+                        tags: archive.tags,
                         thumbnail: Data(),
                         cached: false,
                         totalPages: requested.count,
+                        toc: archive.toc,
                         lastUpdate: Date()
                     )
                     try database.saveCache(&cache)
@@ -837,6 +873,27 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
         pages.enumerated().map { index, path in
             ReaderExtractedPage(archiveId: archiveId, path: path, archivePageNumber: index + 1)
         }
+    }
+
+    private static func tankoubonChapters(
+        from archiveMetadata: ArchiveIndexResponse?,
+        pageOffset: Int,
+        extractedPageCount: Int
+    ) -> [ArchiveChapter] {
+        guard extractedPageCount > 0, let archiveMetadata else { return [] }
+        var chapters: [ArchiveChapter] = (archiveMetadata.toc ?? []).compactMap { chapter in
+            guard (1...extractedPageCount).contains(chapter.page) else { return nil }
+            return ArchiveChapter(name: chapter.name, page: pageOffset + chapter.page)
+        }
+        let firstPage = pageOffset + 1
+        if !archiveMetadata.title.isEmpty,
+           !chapters.contains(where: { $0.page == firstPage }) {
+            chapters.insert(
+                ArchiveChapter(name: archiveMetadata.title, page: firstPage),
+                at: 0
+            )
+        }
+        return chapters
     }
 
     private static func readerPageNumbers(
@@ -1214,9 +1271,9 @@ struct ArchiveReader: View {
                     sliderPreviewRow(
                         store: store,
                         displayIndex: displayIndex,
-                        isRightToLeft: isRightToLeft,
+                        sliderContext: sliderContext,
                         bubbleLayout: bubbleLayout,
-                        sliderHorizontalPadding: sliderHorizontalPadding
+                        showsChapterMenu: !store.chapters.isEmpty
                     )
                 }
 
@@ -1235,20 +1292,23 @@ struct ArchiveReader: View {
     private func sliderPreviewRow(
         store: StoreOf<ArchiveReaderFeature>,
         displayIndex: Int,
-        isRightToLeft: Bool,
+        sliderContext: ReaderSliderContext,
         bubbleLayout: SliderPreviewBubbleLayout,
-        sliderHorizontalPadding: CGFloat
+        showsChapterMenu: Bool
     ) -> some View {
         GeometryReader { geometry in
+            let chapterMenuInset = showsChapterMenu ? ReaderToolbarMetrics.chapterMenuInset : 0
             let bubbleLeadingX = SliderPreviewPositioning.bubbleLeadingX(
                 pageIndex: displayIndex,
                 pageCount: store.pages.count,
                 track: SliderPreviewTrackGeometry(
                     rowWidth: geometry.size.width,
-                    sliderHorizontalPadding: sliderHorizontalPadding,
-                    bubbleWidth: bubbleLayout.width
+                    sliderHorizontalPadding: sliderContext.horizontalPadding,
+                    bubbleWidth: bubbleLayout.width,
+                    leadingInset: sliderContext.isRightToLeft ? 0 : chapterMenuInset,
+                    trailingInset: sliderContext.isRightToLeft ? chapterMenuInset : 0
                 ),
-                isRightToLeft: isRightToLeft
+                isRightToLeft: sliderContext.isRightToLeft
             )
 
             SliderPreviewBubble(
@@ -1407,51 +1467,84 @@ struct ArchiveReader: View {
         store: StoreOf<ArchiveReaderFeature>,
         context: ReaderSliderContext
     ) -> some View {
-        GeometryReader { geometry in
-            let sliderWidth = max(geometry.size.width - context.horizontalPadding * 2, 1)
-
-            ZStack {
-                Slider(
-                    value: .constant(context.displayValue),
-                    in: 0...Double(context.maxIndex),
-                    step: 1
-                )
-                .tint(Color(uiColor: .systemBlue))
-                .padding(.horizontal, context.horizontalPadding)
-                .scaleEffect(x: context.isRightToLeft ? -1 : 1, y: 1)
-                .allowsHitTesting(false)
-
-                Rectangle()
-                    .fill(Color.clear)
-                    .contentShape(Rectangle())
-                    .gesture(
-                        DragGesture(minimumDistance: 0)
-                            .onChanged { value in
-                                if !store.sliderDragging {
-                                    store.send(.sliderDragStarted)
-                                }
-                                sendSliderDragChanged(
-                                    store: store,
-                                    locationX: value.location.x,
-                                    sliderWidth: sliderWidth,
-                                    context: context
-                                )
-                            }
-                            .onEnded { value in
-                                sendSliderDragChanged(
-                                    store: store,
-                                    locationX: value.location.x,
-                                    sliderWidth: sliderWidth,
-                                    context: context
-                                )
-                                store.send(.sliderDragEnded)
-                            }
-                    )
+        HStack(spacing: ReaderToolbarMetrics.chapterMenuSpacing) {
+            if !store.chapters.isEmpty {
+                readerChapterMenu(store: store)
             }
+
+            GeometryReader { geometry in
+                let sliderWidth = max(geometry.size.width - context.horizontalPadding * 2, 1)
+
+                ZStack {
+                    Slider(
+                        value: .constant(context.displayValue),
+                        in: 0...Double(context.maxIndex),
+                        step: 1
+                    )
+                    .tint(Color(uiColor: .systemBlue))
+                    .padding(.horizontal, context.horizontalPadding)
+                    .scaleEffect(x: context.isRightToLeft ? -1 : 1, y: 1)
+                    .allowsHitTesting(false)
+
+                    Rectangle()
+                        .fill(Color.clear)
+                        .contentShape(Rectangle())
+                        .gesture(
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { value in
+                                    if !store.sliderDragging {
+                                        store.send(.sliderDragStarted)
+                                    }
+                                    sendSliderDragChanged(
+                                        store: store,
+                                        locationX: value.location.x,
+                                        sliderWidth: sliderWidth,
+                                        context: context
+                                    )
+                                }
+                                .onEnded { value in
+                                    sendSliderDragChanged(
+                                        store: store,
+                                        locationX: value.location.x,
+                                        sliderWidth: sliderWidth,
+                                        context: context
+                                    )
+                                    store.send(.sliderDragEnded)
+                                }
+                        )
+                }
+            }
+            .frame(height: 34)
+            .environment(\.layoutDirection, .leftToRight)
+            .accessibilityLabel(Text("archive.reader.page.slider"))
         }
-        .frame(height: 34)
-        .environment(\.layoutDirection, .leftToRight)
-        .accessibilityLabel(Text("archive.reader.page.slider"))
+        .frame(height: store.chapters.isEmpty ? 34 : ReaderToolbarMetrics.buttonSize)
+    }
+
+    private func readerChapterMenu(
+        store: StoreOf<ArchiveReaderFeature>
+    ) -> some View {
+        Menu {
+            ForEach(store.chapters) { chapter in
+                Button(chapter.name) {
+                    store.send(.chapterSelected(chapter.page))
+                }
+            }
+        } label: {
+            Label("archive.reader.chapters", systemImage: "list.bullet.rectangle")
+                .labelStyle(.iconOnly)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(Color.indigo)
+                .frame(width: ReaderToolbarMetrics.buttonSize, height: ReaderToolbarMetrics.buttonSize)
+                .background(Color(uiColor: .secondarySystemBackground).opacity(0.82), in: Circle())
+                .overlay {
+                    Circle()
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                }
+        }
+        .menuOrder(.fixed)
+        .buttonStyle(.plain)
+        .clipShape(Circle())
     }
 
     private func sendSliderDragChanged(
@@ -1507,6 +1600,8 @@ private enum ReaderToolbarMetrics {
     static let previewBottomSpacing: CGFloat = 12
     static let sliderHorizontalPadding: CGFloat = 16
     static let buttonSize: CGFloat = 44
+    static let chapterMenuSpacing: CGFloat = 10
+    static let chapterMenuInset = buttonSize + chapterMenuSpacing
 }
 
 enum SliderPreviewPositioning {
@@ -1527,8 +1622,14 @@ enum SliderPreviewPositioning {
         track: SliderPreviewTrackGeometry,
         isRightToLeft: Bool
     ) -> CGFloat {
-        let sliderWidth = max(track.rowWidth - track.sliderHorizontalPadding * 2, 1)
-        let thumbCenterX = track.sliderHorizontalPadding + (
+        let sliderWidth = max(
+            track.rowWidth
+                - track.leadingInset
+                - track.trailingInset
+                - track.sliderHorizontalPadding * 2,
+            1
+        )
+        let thumbCenterX = track.leadingInset + track.sliderHorizontalPadding + (
             sliderWidth * visualNormalized(
                 pageIndex: pageIndex,
                 pageCount: pageCount,
@@ -1560,6 +1661,22 @@ struct SliderPreviewTrackGeometry {
     let rowWidth: CGFloat
     let sliderHorizontalPadding: CGFloat
     let bubbleWidth: CGFloat
+    let leadingInset: CGFloat
+    let trailingInset: CGFloat
+
+    init(
+        rowWidth: CGFloat,
+        sliderHorizontalPadding: CGFloat,
+        bubbleWidth: CGFloat,
+        leadingInset: CGFloat = 0,
+        trailingInset: CGFloat = 0
+    ) {
+        self.rowWidth = rowWidth
+        self.sliderHorizontalPadding = sliderHorizontalPadding
+        self.bubbleWidth = bubbleWidth
+        self.leadingInset = leadingInset
+        self.trailingInset = trailingInset
+    }
 }
 
 private struct SliderPreviewBubble: View {

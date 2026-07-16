@@ -3,6 +3,12 @@
 import Foundation
 import SwiftUI
 
+struct ArchiveChapter: Codable, Equatable, Hashable, Identifiable, Sendable {
+    var id: Int { page }
+    let name: String
+    let page: Int
+}
+
 public struct ArchiveItem: Identifiable, Equatable, Hashable, Sendable {
     public let id: String
     var name: String
@@ -12,6 +18,7 @@ public struct ArchiveItem: Identifiable, Equatable, Hashable, Sendable {
     var progress: Int
     let pagecount: Int
     let dateAdded: Int?
+    var toc: [ArchiveChapter]?
     var refresh: Bool = false
 }
 
@@ -28,12 +35,14 @@ public struct TankoubonDetailsMetadata: Equatable, Hashable, Sendable {
     public var name: String?
     public var tags: String
     public let includedArchiveTags: String
+    var toc: [ArchiveChapter]?
 
     public init(id: String, name: String? = nil, tags: String = "", includedArchiveTags: String = "") {
         self.id = id
         self.name = name
         self.tags = tags
         self.includedArchiveTags = includedArchiveTags
+        self.toc = nil
     }
 
     init(response: TankoubonFullResponse) {
