@@ -27,11 +27,11 @@
       ],
       "versions": [
         {
-          "version": "3.9.1",
-          "date": "2026-07-12T02:54:58",
-          "localizedDescription": "https://github.com/Doraemoe/LANreader/releases/tag/3.9.1-187",
-          "downloadURL": "https://github.com/AokazeNozomi/LANreader17.0/releases/download/v3.9.1/LANreader.ipa",
-          "size": 8867367,
+          "version": "3.9.2",
+          "date": "2026-07-16T02:51:48",
+          "localizedDescription": "https://github.com/Doraemoe/LANreader/releases/tag/3.9.2-192",
+          "downloadURL": "https://github.com/AokazeNozomi/LANreader17.0/releases/download/v3.9.2/LANreader.ipa",
+          "size": 9397002,
           "minOSVersion": "17.0"
         }
       ],
