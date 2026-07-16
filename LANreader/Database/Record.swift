@@ -32,6 +32,7 @@ struct ArchiveCache: Identifiable, Equatable {
     var thumbnail: Data?
     var cached: Bool
     var totalPages: Int
+    var toc: [ArchiveChapter]?
     var lastUpdate: Date
 }
 
@@ -117,7 +118,24 @@ extension ArchiveCache: Codable, FetchableRecord, MutablePersistableRecord {
         static let thumbnail = Column(CodingKeys.thumbnail)
         static let cached = Column(CodingKeys.cached)
         static let totalPages = Column(CodingKeys.totalPages)
+        static let toc = Column(CodingKeys.toc)
         static let lastUpdate = Column(CodingKeys.lastUpdate)
+    }
+}
+
+extension ArchiveCache {
+    func toArchiveItem() -> ArchiveItem {
+        ArchiveItem(
+            id: id,
+            name: title,
+            extension: "",
+            tags: tags,
+            isNew: false,
+            progress: 0,
+            pagecount: totalPages,
+            dateAdded: nil,
+            toc: toc
+        )
     }
 }
 
