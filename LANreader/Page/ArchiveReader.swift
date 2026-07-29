@@ -45,6 +45,7 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
         @SharedReader(.appStorage(SettingsKey.splitPiorityLeft)) var piorityLeft = false
         @SharedReader(.appStorage(SettingsKey.autoPageInterval)) var autoPageInterval = 5.0
         @SharedReader(.appStorage(SettingsKey.doublePageLayout)) var doublePageLayout = false
+        @SharedReader(.appStorage(SettingsKey.fitPageWidth)) var fitPageWidth = false
 
         var currentArchiveId = ""
         var currentPageIndex = 0
@@ -217,8 +218,11 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                            $0.pageNumber < $1.pageNumber
                        }
                    state.pages.append(contentsOf: pageState)
-                   state.currentPageIndex = ReaderPositioning.defaultStartPageIndex(
+                   let cachedProgress = state.allArchives[id: id]?.wrappedValue.progress ?? 0
+                   state.currentPageIndex = ReaderPositioning.initialPageIndex(
+                       progress: cachedProgress,
                        pageCount: state.pages.count,
+                       fromStart: state.fromStart,
                        readDirection: state.resolvedReadDirection,
                        doublePageLayout: state.doublePageLayout
                    )
@@ -358,7 +362,12 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                     }
                 }
                 if state.cached {
-                    return .none
+                    return .run(priority: .background) { [id = state.currentArchiveId] _ in
+                        _ = try database.updateCacheProgress(id, progress: pageNumber)
+                    } catch: { [state] error, _ in
+                        logger.error("failed to update cached archive progress. id=\(state.currentArchiveId) \(error)")
+                    }
+                    .cancellable(id: CancelId.updateProgress, cancelInFlight: true)
                 }
                 return .run(priority: .background) { [state] _ in
                     try await clock.sleep(for: .seconds(0.5))
@@ -781,7 +790,8 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                         cached: false,
                         totalPages: requested.count,
                         toc: archive.toc,
-                        lastUpdate: Date()
+                        lastUpdate: Date(),
+                        progress: archive.progress
                     )
                     try database.saveCache(&cache)
                     await send(.finishDownloadPages)
