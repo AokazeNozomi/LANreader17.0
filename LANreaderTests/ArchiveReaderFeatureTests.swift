@@ -11,6 +11,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
     override func tearDown() {
         UserDefaults.standard.removeObject(forKey: SettingsKey.readDirection)
         UserDefaults.standard.removeObject(forKey: SettingsKey.doublePageLayout)
+        UserDefaults.standard.removeObject(forKey: SettingsKey.fitPageWidth)
         UserDefaults.standard.removeObject(forKey: SettingsKey.autoPageInterval)
         UserDefaults.standard.removeObject(forKey: SettingsKey.splitWideImage)
         UserDefaults.standard.removeObject(forKey: SettingsKey.splitPiorityLeft)
@@ -63,6 +64,15 @@ final class ArchiveReaderFeatureTests: XCTestCase {
         await store.send(.splitWideImageChanged(false)) {
             $0.$splitWideImage.withLock { $0 = false }
         }
+    }
+
+    @MainActor
+    func testUIPageCellFitWidthAspectRatio() {
+        XCTAssertEqual(
+            UIPageCell.fitWidthAspectRatio(for: CGSize(width: 1_000, height: 1_500)),
+            1.5
+        )
+        XCTAssertNil(UIPageCell.fitWidthAspectRatio(for: CGSize(width: 0, height: 1_500)))
     }
 
     func testReaderPositioningSinglePageMath() {
@@ -639,13 +649,24 @@ final class ArchiveReaderFeatureTests: XCTestCase {
     }
 
     @MainActor
-    func testVisiblePageChangedUpdatesProgressAndClearsNewFlag() async {
+    func testVisiblePageChangedUpdatesProgressAndClearsNewFlag() async throws {
         configureReaderDefaults()
-        let clock = TestClock()
+        let database = try makeInMemoryDatabase()
+        var cache = ArchiveCache(
+            id: "archive",
+            title: "Archive",
+            tags: "",
+            thumbnail: nil,
+            cached: true,
+            totalPages: 3,
+            toc: nil,
+            lastUpdate: Date(timeIntervalSince1970: 1)
+        )
+        try database.saveCache(&cache)
         var initialState = makeState(progress: 0, cached: true, isNew: true)
         initialState.pages = makePageStates(count: 3)
         let store = makeTestStore(initialState: initialState) {
-            $0.continuousClock = clock
+            $0.appDatabase = database
         }
 
         await store.send(.visiblePageChanged(1)) {
@@ -655,17 +676,34 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 $0.isNew = false
             }
         }
+        await store.finish()
+
+        XCTAssertEqual(try database.readCache("archive")?.progress, 2)
     }
 
     @MainActor
-    func testVisiblePageChangedDoesNotClearNewFlagForTankArchive() async {
+    func testVisiblePageChangedDoesNotClearNewFlagForTankArchive() async throws {
         configureReaderDefaults()
 
         let tankId = "TANK_1783084742"
         let sourceArchives = makeTankSourceArchives()
+        let database = try makeInMemoryDatabase()
+        var cache = ArchiveCache(
+            id: tankId,
+            title: "Tank",
+            tags: "",
+            thumbnail: nil,
+            cached: true,
+            totalPages: 3,
+            toc: nil,
+            lastUpdate: Date(timeIntervalSince1970: 1)
+        )
+        try database.saveCache(&cache)
         var initialState = makeState(archiveId: tankId, progress: 0, cached: true, isNew: true)
         initialState.pages = makePageStates(archiveId: tankId, sourceArchives: sourceArchives)
-        let store = makeTestStore(initialState: initialState)
+        let store = makeTestStore(initialState: initialState) {
+            $0.appDatabase = database
+        }
 
         await store.send(.visiblePageChanged(1)) {
             $0.currentPageIndex = 1
@@ -673,6 +711,9 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 $0.progress = 2
             }
         }
+        await store.finish()
+
+        XCTAssertEqual(try database.readCache(tankId)?.progress, 2)
     }
 
     @MainActor
@@ -884,6 +925,45 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 id: 0,
                 targetPageIndex: 3,
                 source: .chapter,
+                animated: false
+            )
+        }
+    }
+
+    @MainActor
+    func testLoadCachedRestoresPersistedProgress() async throws {
+        configureReaderDefaults()
+        let id = "cachedRestoreArchive"
+        let cacheFolder = LANraragiService.cachePath!.appendingPathComponent(id, conformingTo: .folder)
+        try? FileManager.default.removeItem(at: cacheFolder)
+        try FileManager.default.createDirectory(at: cacheFolder, withIntermediateDirectories: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: cacheFolder)
+        }
+        for page in 1...5 {
+            FileManager.default.createFile(
+                atPath: cacheFolder.appendingPathComponent("\(page)").path,
+                contents: Data()
+            )
+        }
+
+        let initialState = makeState(archiveId: id, progress: 3, cached: true)
+        let store = makeTestStore(initialState: initialState)
+
+        let expectedPages = IdentifiedArray(uniqueElements: (1...5).map {
+            PageFeature.State(archiveId: id, pageId: "\($0)", pageNumber: $0, cached: true)
+        })
+
+        await store.send(.loadCached) {
+            $0.pages = expectedPages
+            $0.currentPageIndex = 2
+            $0.controlUiHidden = true
+        }
+        await store.receive(.requestJump(2, source: .initialRestore)) {
+            $0.scrollRequest = makeScrollRequest(
+                id: 0,
+                targetPageIndex: 2,
+                source: .initialRestore,
                 animated: false
             )
         }
