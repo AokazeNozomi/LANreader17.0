@@ -11,12 +11,12 @@ public struct SearchFilter: Equatable, Sendable {
     let filter: String?
 }
 
-public struct TagWithType: Equatable {
+public struct TagWithType: Equatable, Sendable {
     let tag: String
     let type: TagType
 }
 
-enum TagType {
+enum TagType: Sendable {
     case suggested
     case popular
 }
@@ -112,6 +112,7 @@ struct SettingsKey {
     static let enablePasscode = "settings:view:passcode:enable"
     static let passcode = "settings:view:passcode"
     static let hideRead = "settings:view:hideRead"
+    static let paginateArchiveList = "settings:view:paginate"
 
     static let lastTagRefresh = "lastTagRefresh"
     static let tabBarHidden = "tab:bar:hidden"

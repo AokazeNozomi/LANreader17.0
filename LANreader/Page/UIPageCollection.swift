@@ -26,6 +26,7 @@ class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
     var dataSource: UICollectionViewDiffableDataSource<Section, String>!
     private var lastReportedVisiblePageIndex: Int?
     private var appliedPageIds: [String] = []
+    private var appliedDoublePageLayout: Bool?
     private var isApplyingSnapshot = false
     private var activeAnimatedScrollTargetPageId: String?
 
@@ -62,7 +63,7 @@ class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
         fatalError("init(coder:) has not been implemented")
     }
 
-    private func setupLayout() {
+    private func makeLayout() -> UICollectionViewCompositionalLayout {
         let heightDimension =
         store.readDirection == ReadDirection.upDown.rawValue
         ? NSCollectionLayoutDimension.estimated(UIScreen.main.bounds.height)
@@ -96,14 +97,26 @@ class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
 
         let configuration = UICollectionViewCompositionalLayoutConfiguration()
         configuration.scrollDirection = store.readDirection == ReadDirection.upDown.rawValue ? .vertical : .horizontal
-        let layout = UICollectionViewCompositionalLayout(section: section, configuration: configuration)
+        return UICollectionViewCompositionalLayout(section: section, configuration: configuration)
+    }
 
-        collectionView = UICollectionView(frame: view.bounds, collectionViewLayout: layout)
+    private func setupLayout() {
+        appliedDoublePageLayout = store.doublePageLayout
+        collectionView = UICollectionView(frame: view.bounds, collectionViewLayout: makeLayout())
         if store.readDirection != ReadDirection.upDown.rawValue {
             collectionView.showsHorizontalScrollIndicator = false
             collectionView.isPagingEnabled = true
         }
         view.addSubview(collectionView)
+    }
+
+    private func applyDoublePageLayoutChange() {
+        isApplyingSnapshot = true
+        collectionView.setCollectionViewLayout(makeLayout(), animated: false)
+        collectionView.layoutIfNeeded()
+        isApplyingSnapshot = false
+        lastReportedVisiblePageIndex = nil
+        consumePendingScrollRequestIfPossible()
     }
 
     private func setupCollectionView() {
@@ -171,7 +184,7 @@ class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
         switch request.source {
         case .initialRestore, .slider:
             return .centeredHorizontally
-        case .chapter, .tap, .keyboard, .autoPage:
+        case .chapter, .tap, .keyboard, .autoPage, .layoutChange:
             return .left
         }
     }
@@ -209,10 +222,19 @@ class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
     }
     private func consumePendingScrollRequestIfPossible() {
         guard let scrollRequest = store.scrollRequest else { return }
+        guard appliedDoublePageLayout == store.doublePageLayout else { return }
         guard scrollToPage(for: scrollRequest) else { return }
         store.send(.scrollRequestHandled(scrollRequest.id))
     }
     private func setupObserve() {
+        observe { [weak self] in
+            guard let self else { return }
+            let doublePageLayout = store.doublePageLayout
+            guard appliedDoublePageLayout != doublePageLayout else { return }
+            appliedDoublePageLayout = doublePageLayout
+            guard resolvedReadDirection != .upDown else { return }
+            applyDoublePageLayoutChange()
+        }
         observe { [weak self] in
             guard let self else { return }
             guard !store.pages.isEmpty else { return }
