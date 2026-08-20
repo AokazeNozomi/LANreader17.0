@@ -37,22 +37,6 @@ final class ArchiveReaderFeatureTests: XCTestCase {
     }
 
     @MainActor
-    func testReadSettingsEnablingDoublePageLayoutDisablesSplitAndKeepsPriority() async {
-        configureReaderDefaults(
-            splitWideImage: true,
-            splitPiorityLeft: true
-        )
-        let store = TestStore(initialState: ReadSettingsFeature.State()) {
-            ReadSettingsFeature()
-        }
-
-        await store.send(.doublePageLayoutChanged(true)) {
-            $0.$splitWideImage.withLock { $0 = false }
-            $0.$doublePageLayout.withLock { $0 = true }
-        }
-    }
-
-    @MainActor
     func testReadSettingsDisablingSplitKeepsPriority() async {
         configureReaderDefaults(
             splitWideImage: true,
@@ -74,6 +58,46 @@ final class ArchiveReaderFeatureTests: XCTestCase {
             1.5
         )
         XCTAssertNil(UIPageCell.fitWidthAspectRatio(for: CGSize(width: 0, height: 1_500)))
+    }
+
+    func testReaderPageLayoutValidatedAspectRatio() {
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(nil), ReaderPageLayout.defaultAspectRatio)
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(0), ReaderPageLayout.defaultAspectRatio)
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(-1), ReaderPageLayout.defaultAspectRatio)
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(.nan), ReaderPageLayout.defaultAspectRatio)
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(.infinity), ReaderPageLayout.defaultAspectRatio)
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(0.01), 0.01)
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(100), 100)
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(1.6), 1.6)
+    }
+
+    func testReaderPageLayoutAspectRatioForSize() {
+        XCTAssertEqual(ReaderPageLayout.aspectRatio(for: CGSize(width: 1_000, height: 1_400)), 1.4)
+        XCTAssertNil(ReaderPageLayout.aspectRatio(for: CGSize(width: 0, height: 1_400)))
+        XCTAssertNil(ReaderPageLayout.aspectRatio(for: CGSize(width: 1_000, height: 0)))
+    }
+
+    func testReaderPageLayoutSplitAspectRatioDoublesSource() {
+        // A split page shows half the source width at the same height.
+        XCTAssertEqual(ReaderPageLayout.splitAspectRatio(for: 0.7), 1.4)
+    }
+
+    func testReaderPageLayoutMedianAspectRatio() {
+        XCTAssertNil(ReaderPageLayout.medianAspectRatio([]))
+        XCTAssertNil(ReaderPageLayout.medianAspectRatio([0, -1, .nan]))
+        XCTAssertEqual(ReaderPageLayout.medianAspectRatio([1.5]), 1.5)
+        XCTAssertEqual(ReaderPageLayout.medianAspectRatio([1.8, 1.2, 1.5]), 1.5)
+        XCTAssertEqual(ReaderPageLayout.medianAspectRatio([1.0, 2.0, 1.4, 1.6]), 1.6)
+    }
+
+    func testReaderPageLayoutItemHeight() {
+        XCTAssertEqual(ReaderPageLayout.itemHeight(width: 100, aspectRatio: 1.4), 140)
+        XCTAssertEqual(ReaderPageLayout.itemHeight(width: 100, aspectRatio: 1.406), 141)
+        // Long-strip webtoon pages must keep their full-width rendered height.
+        XCTAssertEqual(ReaderPageLayout.itemHeight(width: 100, aspectRatio: 20), 2_000)
+        // Unmeasured pages fall back to the default ratio rather than collapsing to zero height.
+        XCTAssertEqual(ReaderPageLayout.itemHeight(width: 100, aspectRatio: nil), 140)
+        XCTAssertEqual(ReaderPageLayout.itemHeight(width: 0, aspectRatio: 1.4), 0)
     }
 
     func testReaderPositioningFinishedMath() {
@@ -472,6 +496,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued([readyThumbnailQueueResult()])
@@ -499,6 +524,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued([readyThumbnailQueueResult()])
@@ -525,6 +551,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued([readyThumbnailQueueResult()])
@@ -553,6 +580,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued([readyThumbnailQueueResult()])
@@ -580,6 +608,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued([readyThumbnailQueueResult()])
@@ -607,6 +636,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued([readyThumbnailQueueResult()])
@@ -634,6 +664,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued([readyThumbnailQueueResult()])
@@ -690,6 +721,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued(readyThumbnailQueueResults(for: sourceArchives))
@@ -943,6 +975,23 @@ final class ArchiveReaderFeatureTests: XCTestCase {
     }
 
     @MainActor
+    func testNavigateNextAtFinalEvenSpreadDoesNothing() async {
+        configureReaderDefaults(doublePageLayout: true)
+        var initialState = makeState(
+            progress: 6,
+            readDirection: .leftRight,
+            doublePageLayout: true
+        )
+        initialState.pages = makePageStates(count: 6)
+        initialState.currentPageIndex = 5
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.navigate(.next, source: .tap))
+
+        XCTAssertNil(store.state.scrollRequest)
+    }
+
+    @MainActor
     func testNavigatePreviousUsesCanonicalDoublePageIndex() async {
         configureReaderDefaults(
             readDirection: .rightLeft,
@@ -1013,6 +1062,41 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 source: .slider,
                 animated: false
             )
+        }
+    }
+
+    @MainActor
+    func testStaleScrollRequestAcknowledgementKeepsNewerRequest() async {
+        configureReaderDefaults()
+        var initialState = makeState(progress: 2)
+        initialState.pages = makePageStates(count: 4)
+        initialState.currentPageIndex = 1
+        let store = makeTestStore(initialState: initialState)
+        let firstRequest = makeScrollRequest(
+            id: 0,
+            targetPageIndex: 1,
+            source: .slider,
+            animated: false
+        )
+        let newerRequest = makeScrollRequest(
+            id: 1,
+            targetPageIndex: 2,
+            source: .chapter,
+            animated: false
+        )
+
+        await store.send(.requestJump(1, source: .slider)) {
+            $0.scrollRequest = firstRequest
+        }
+        await store.send(.requestJump(2, source: .chapter)) {
+            $0.scrollRequest = newerRequest
+        }
+
+        await store.send(.scrollRequestHandled(incrementingUUID(0)))
+        XCTAssertEqual(store.state.scrollRequest, newerRequest)
+
+        await store.send(.scrollRequestHandled(incrementingUUID(1))) {
+            $0.scrollRequest = nil
         }
     }
 
@@ -1109,6 +1193,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
     }
 
     @MainActor
@@ -1148,6 +1233,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
     }
 
     @MainActor
@@ -1193,6 +1279,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
     }
 
     func testArchiveCachePersistsChapters() throws {
@@ -1311,6 +1398,76 @@ final class ArchiveReaderFeatureTests: XCTestCase {
         await store.receive(.refreshProgress)
         await clock.advance(by: .seconds(2))
         await store.finish()
+    }
+
+    @MainActor
+    func testPageAspectRatiosPrimedAssignsRatiosAndMedianEstimate() async {
+        configureReaderDefaults(readDirection: .upDown)
+        var initialState = makeState(readDirection: .upDown)
+        initialState.pages = makePageStates(count: 3)
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.pageAspectRatiosPrimed([1: 1.2, 2: 1.5, 3: 1.8])) {
+            $0.pages[0].imageAspectRatio = 1.2
+            $0.pages[1].imageAspectRatio = 1.5
+            $0.pages[2].imageAspectRatio = 1.8
+            $0.estimatedPageAspectRatio = 1.5
+        }
+    }
+
+    @MainActor
+    func testPageAspectRatiosPrimedLeavesAlreadyMeasuredPagesUntouched() async {
+        configureReaderDefaults(readDirection: .upDown)
+        var initialState = makeState(readDirection: .upDown)
+        initialState.pages = makePageStates(count: 2)
+        initialState.pages[0].imageAspectRatio = 2.0
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.pageAspectRatiosPrimed([1: 1.2, 2: 1.4])) {
+            $0.pages[1].imageAspectRatio = 1.4
+            $0.estimatedPageAspectRatio = 2.0
+        }
+    }
+
+    @MainActor
+    func testPrimePageAspectRatiosWithoutPagesDoesNothing() async {
+        configureReaderDefaults(readDirection: .upDown)
+        let store = makeTestStore(initialState: makeState(readDirection: .upDown))
+
+        await store.send(.primePageAspectRatios)
+    }
+
+    @MainActor
+    func testSplitPageResolutionCopiesAspectRatioToInsertedSibling() async {
+        configureReaderDefaults(splitWideImage: true)
+        var initialState = makeState(progress: 1)
+        initialState.$splitImage = SharedReader(value: true)
+        initialState.pages = makePageStates(count: 2)
+        initialState.pages[0].imageAspectRatio = 0.7
+        initialState.currentPageIndex = 0
+        let splittingPageId = initialState.pages[0].id
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.page(.element(
+            id: splittingPageId,
+            action: .storedImageResolved(shouldDisplayAsSplitPages: true)
+        ))) {
+            $0.pages[0].pageMode = .right
+            $0.pages[0].imageLoaded = true
+            var sibling = loadedPageState(
+                archiveId: "archive",
+                pageId: "1",
+                pageNumber: 1,
+                pageMode: .left
+            )
+            sibling.imageAspectRatio = 0.7
+            $0.pages.insert(sibling, at: 1)
+            $0.estimatedPageAspectRatio = 0.7
+        }
+
+        // A split page shows half the source width, so it renders twice as tall relative to its width.
+        XCTAssertEqual(store.state.pages[0].displayAspectRatio, 1.4)
+        XCTAssertEqual(store.state.pages[1].displayAspectRatio, 1.4)
     }
 
     @MainActor
@@ -1626,6 +1783,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
         controller.loadViewIfNeeded()
         await Task.yield()
         await Task.yield()
+        await waitForScrollRequestToFinish(store)
 
         XCTAssertNil(store.scrollRequest)
     }
@@ -1650,6 +1808,75 @@ final class ArchiveReaderFeatureTests: XCTestCase {
 
         XCTAssertEqual(store.currentPageIndex, 2)
         XCTAssertEqual(store.allArchives[id: "archive"]?.wrappedValue.progress, 3)
+    }
+
+    @MainActor
+    func testUIPageCollectionShiftsSpreadItemsWhenToggledFromSecondPage() async {
+        configureReaderDefaults()
+        var initialState = makeState(progress: 2)
+        initialState.pages = makePageStates(count: 5)
+        initialState.currentPageIndex = 1
+        let expectedItems = [ReaderCollectionItem.spreadPlaceholder]
+            + initialState.pages.map { ReaderCollectionItem.page($0.id) }
+
+        let store = Store(initialState: initialState) {
+            ArchiveReaderFeature()
+        } withDependencies: {
+            $0.continuousClock = ImmediateClock()
+            $0.uuid = .incrementing
+        }
+        let controller = UIPageCollectionController(store: store)
+
+        controller.loadViewIfNeeded()
+        await Task.yield()
+        await store.send(.toggleDoublePageLayout).finish()
+        await Task.yield()
+        await Task.yield()
+        await waitForScrollRequestToFinish(store)
+
+        XCTAssertEqual(store.spreadPairingOffset, 1)
+        let collectionItems = controller.dataSource.snapshot().itemIdentifiers
+        XCTAssertEqual(collectionItems, expectedItems)
+        XCTAssertEqual(collectionItems[2], .page(initialState.pages[1].id))
+        XCTAssertEqual(collectionItems[3], .page(initialState.pages[2].id))
+        XCTAssertNil(store.scrollRequest)
+    }
+
+    @MainActor
+    func testUIPageCollectionRepeatedDoublePageTogglesStayAlignedToSpreadBoundary() async {
+        configureReaderDefaults()
+        var initialState = makeState(progress: 2)
+        initialState.pages = makePageStates(count: 5)
+        initialState.currentPageIndex = 1
+
+        let store = Store(initialState: initialState) {
+            ArchiveReaderFeature()
+        } withDependencies: {
+            $0.continuousClock = ImmediateClock()
+            $0.uuid = .incrementing
+        }
+        let controller = UIPageCollectionController(store: store)
+
+        controller.loadViewIfNeeded()
+        controller.view.frame = CGRect(x: 0, y: 0, width: 320, height: 480)
+        controller.view.layoutIfNeeded()
+        await Task.yield()
+        await Task.yield()
+
+        store.send(.toggleDoublePageLayout)
+        store.send(.toggleDoublePageLayout)
+        store.send(.toggleDoublePageLayout)
+        await Task.yield()
+        await Task.yield()
+        await Task.yield()
+        await waitForScrollRequestToFinish(store)
+        controller.collectionView.layoutIfNeeded()
+
+        let viewportWidth = controller.collectionView.bounds.width
+        let remainder = controller.collectionView.contentOffset.x
+            .truncatingRemainder(dividingBy: viewportWidth)
+        XCTAssertEqual(remainder, 0, accuracy: 1)
+        XCTAssertNil(store.scrollRequest)
     }
 
     @MainActor
@@ -2186,6 +2413,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
         )
         state.pages = makePageStates(count: 3, archiveId: "one")
         state.currentPageIndex = 2
+        state.spreadPairingOffset = 1
         state.fromStart = true
         state.scrollRequest = ScrollRequest(targetPageIndex: 2, source: .slider, animated: false)
         state.inCache = true
@@ -2204,6 +2432,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
 
         XCTAssertTrue(state.pages.isEmpty)
         XCTAssertEqual(state.currentPageIndex, 0)
+        XCTAssertEqual(state.spreadPairingOffset, 0)
         XCTAssertFalse(state.fromStart)
         XCTAssertNil(state.scrollRequest)
         XCTAssertFalse(state.inCache)
@@ -2241,20 +2470,66 @@ final class ArchiveReaderFeatureTests: XCTestCase {
     }
 
     @MainActor
-    func testToggleDoublePageLayoutDisablesLayoutAndKeepsCurrentPage() async {
-        configureReaderDefaults(doublePageLayout: true)
-        var initialState = makeState(progress: 4, doublePageLayout: true)
+    func testToggleDoublePageLayoutMakesCurrentLTRPageStartOfShiftedSpread() async {
+        configureReaderDefaults(readDirection: .leftRight)
+        var initialState = makeState(progress: 2, readDirection: .leftRight)
         initialState.pages = makePageStates(count: 5)
-        initialState.currentPageIndex = 3
+        initialState.currentPageIndex = 1
         let store = makeTestStore(initialState: initialState)
 
         await store.send(.toggleDoublePageLayout) {
-            $0.$doublePageLayout.withLock { $0 = false }
+            $0.spreadPairingOffset = 1
+            $0.$doublePageLayout.withLock { $0 = true }
         }
-        await store.receive(.requestJump(3, source: .layoutChange)) {
+        await store.receive(.requestJump(2, source: .layoutChange)) {
             $0.scrollRequest = makeScrollRequest(
                 id: 0,
-                targetPageIndex: 3,
+                targetPageIndex: 2,
+                source: .layoutChange,
+                animated: false
+            )
+        }
+    }
+
+    @MainActor
+    func testToggleDoublePageLayoutMakesCurrentRTLPageStartOfShiftedSpread() async {
+        configureReaderDefaults(readDirection: .rightLeft)
+        var initialState = makeState(progress: 2, readDirection: .rightLeft)
+        initialState.pages = makePageStates(count: 5)
+        initialState.currentPageIndex = 1
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.toggleDoublePageLayout) {
+            $0.spreadPairingOffset = 1
+            $0.$doublePageLayout.withLock { $0 = true }
+        }
+        await store.receive(.requestJump(2, source: .layoutChange)) {
+            $0.scrollRequest = makeScrollRequest(
+                id: 0,
+                targetPageIndex: 2,
+                source: .layoutChange,
+                animated: false
+            )
+        }
+    }
+
+    @MainActor
+    func testToggleDoublePageLayoutDisablesLayoutAndKeepsCurrentPage() async {
+        configureReaderDefaults(doublePageLayout: true)
+        var initialState = makeState(progress: 3, doublePageLayout: true)
+        initialState.pages = makePageStates(count: 5)
+        initialState.currentPageIndex = 2
+        initialState.spreadPairingOffset = 1
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.toggleDoublePageLayout) {
+            $0.spreadPairingOffset = 0
+            $0.$doublePageLayout.withLock { $0 = false }
+        }
+        await store.receive(.requestJump(2, source: .layoutChange)) {
+            $0.scrollRequest = makeScrollRequest(
+                id: 0,
+                targetPageIndex: 2,
                 source: .layoutChange,
                 animated: false
             )
@@ -2275,6 +2550,13 @@ final class ArchiveReaderFeatureTests: XCTestCase {
         splitState.$splitImage = SharedReader(value: true)
         let splitStore = makeTestStore(initialState: splitState)
         await splitStore.send(.toggleDoublePageLayout)
+    }
+}
+
+@MainActor
+private func waitForScrollRequestToFinish(_ store: StoreOf<ArchiveReaderFeature>) async {
+    for _ in 0..<100 where store.scrollRequest != nil {
+        try? await Task<Never, Never>.sleep(for: .milliseconds(10))
     }
 }
 

@@ -50,6 +50,7 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
 
         var currentArchiveId = ""
         var currentPageIndex = 0
+        var spreadPairingOffset = 0
         var scrollRequest: ScrollRequest?
         var pages: IdentifiedArrayOf<PageFeature.State> = []
         var collectionScrolling = false
@@ -75,6 +76,9 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
         var sliderPreviewLoading = false
         var sliderThumbnailJobsById: [Int: String] = [:]
         var sliderReadyThumbnailPages: Set<Int> = []
+        /// Median aspect ratio of the pages measured so far, used to size pages that have not been
+        /// measured yet. Pages within an archive are near-uniform, so this converges almost immediately.
+        var estimatedPageAspectRatio: Double = ReaderPageLayout.defaultAspectRatio
 
         var allArchives: IdentifiedArrayOf<Shared<ArchiveItem>> = []
 
@@ -143,6 +147,8 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
         case page(IdentifiedActionOf<PageFeature>)
         case extractArchive
         case finishExtracting([ReaderExtractedPage], TankoubonDetailsMetadata?)
+        case primePageAspectRatios
+        case pageAspectRatiosPrimed([Int: Double])
         case toggleControlUi(Bool?)
         case toggleDoublePageLayout
         case visiblePageChanged(Int)
@@ -194,6 +200,7 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
         case sliderPreviewThumbnailQueue
         case sliderPreviewThumbnailPolling
         case sliderPreviewLoad
+        case primePageAspectRatios
     }
 
     public var body: some ReducerOf<Self> {
@@ -238,11 +245,15 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                        fromStart: state.fromStart,
                        restartFinishedArchive: restartFinishedArchive,
                        readDirection: state.resolvedReadDirection,
-                       doublePageLayout: state.doublePageLayout
+                       doublePageLayout: state.doublePageLayout,
+                       spreadOffset: state.spreadPairingOffset
                    )
                    state.controlUiHidden = true
                    state.extracting = false
-                   return .send(.requestJump(state.currentPageIndex, source: .initialRestore))
+                   return .merge(
+                       .send(.requestJump(state.currentPageIndex, source: .initialRestore)),
+                       .send(.primePageAspectRatios)
+                   )
                } else {
                    self.resetSliderPreviewArchiveState(state: &state)
                    state.controlUiHidden = true
@@ -342,7 +353,8 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                         fromStart: state.fromStart,
                         restartFinishedArchive: restartFinishedArchive,
                         readDirection: state.resolvedReadDirection,
-                        doublePageLayout: state.doublePageLayout
+                        doublePageLayout: state.doublePageLayout,
+                        spreadOffset: state.spreadPairingOffset
                     )
                     state.currentPageIndex = pageIndexToShow
                     state.controlUiHidden = true
@@ -350,7 +362,27 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                 state.extracting = false
                 guard !state.pages.isEmpty else { return .none }
                 let initialRestore = Effect<Action>.send(.requestJump(state.currentPageIndex, source: .initialRestore))
-                return .merge(initialRestore, .send(.prepareSliderPreviewThumbnails))
+                return .merge(
+                    initialRestore,
+                    .send(.primePageAspectRatios),
+                    .send(.prepareSliderPreviewThumbnails)
+                )
+            case .primePageAspectRatios:
+                guard let folder = state.pages.first?.folder else { return .none }
+                return .run(priority: .utility) { send in
+                    let aspectRatios = imageService.storedImageAspectRatios(folderUrl: folder)
+                    guard !aspectRatios.isEmpty else { return }
+                    await send(.pageAspectRatiosPrimed(aspectRatios))
+                }
+                .cancellable(id: CancelId.primePageAspectRatios, cancelInFlight: true)
+            case let .pageAspectRatiosPrimed(aspectRatios):
+                for pageId in state.pages.ids {
+                    guard let page = state.pages[id: pageId], page.imageAspectRatio == nil else { continue }
+                    guard let aspectRatio = aspectRatios[page.pageNumber] else { continue }
+                    state.pages[id: pageId]?.imageAspectRatio = aspectRatio
+                }
+                self.updateEstimatedPageAspectRatio(state: &state)
+                return .none
             case let .toggleControlUi(show):
                 if let shouldShow = show {
                     state.controlUiHidden = shouldShow
@@ -366,12 +398,14 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
             case .toggleDoublePageLayout:
                 guard state.canToggleDoublePageLayout else { return .none }
                 let enabled = !state.doublePageLayout
+                state.spreadPairingOffset = enabled ? state.safeCurrentPageIndex % 2 : 0
                 state.$doublePageLayout.withLock { $0 = enabled }
                 let targetIndex = ReaderPositioning.canonicalPageIndex(
                     forVisibleIndex: state.currentPageIndex,
                     pageCount: state.pages.count,
                     readDirection: state.resolvedReadDirection,
-                    doublePageLayout: enabled
+                    doublePageLayout: enabled,
+                    spreadOffset: state.spreadPairingOffset
                 )
                 return .send(.requestJump(targetIndex, source: .layoutChange))
             case let .visiblePageChanged(index):
@@ -670,7 +704,8 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                     direction: direction,
                     pageCount: state.pages.count,
                     readDirection: state.resolvedReadDirection,
-                    doublePageLayout: state.doublePageLayout
+                    doublePageLayout: state.doublePageLayout,
+                    spreadOffset: state.spreadPairingOffset
                 ) else {
                     return .none
                 }
@@ -741,6 +776,7 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                     shouldDisplayAsSplitPages: shouldDisplayAsSplitPages,
                     state: &state
                 )
+                self.updateEstimatedPageAspectRatio(state: &state)
                 return .none
             case .page:
                 return .none
@@ -968,6 +1004,14 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
         }
     }
 
+    private func updateEstimatedPageAspectRatio(state: inout State) {
+        guard let median = ReaderPageLayout.medianAspectRatio(state.pages.compactMap(\.imageAspectRatio)) else {
+            return
+        }
+        guard state.estimatedPageAspectRatio != median else { return }
+        state.estimatedPageAspectRatio = median
+    }
+
     private func handleSplitResolution(
         id: PageFeature.State.ID,
         shouldDisplayAsSplitPages: Bool,
@@ -1049,6 +1093,7 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
             cached: current.cached
         )
         insertedPage.imageLoaded = true
+        insertedPage.imageAspectRatio = current.imageAspectRatio
         guard state.pages[id: insertedPage.id] == nil else { return }
 
         let leadingSplitMode = PageMode.preferredSplitMode(priorityLeft: state.piorityLeft)
@@ -1171,6 +1216,7 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
     func resetState(state: inout State) {
         state.pages = []
         state.currentPageIndex = 0
+        state.spreadPairingOffset = 0
         state.fromStart = false
         state.scrollRequest = nil
         state.collectionScrolling = false
@@ -1179,6 +1225,7 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
         state.errorMessage = ""
         state.successMessage = ""
         state.currentTankoubonDetails = nil
+        state.estimatedPageAspectRatio = ReaderPageLayout.defaultAspectRatio
         resetSliderPreviewArchiveState(state: &state)
     }
 }
