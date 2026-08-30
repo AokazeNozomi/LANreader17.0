@@ -25,6 +25,7 @@ enum ReaderCollectionItem: Hashable {
     case page(String)
 }
 
+// swiftlint:disable type_body_length
 class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
     let store: StoreOf<ArchiveReaderFeature>
     var collectionView: UICollectionView!
@@ -176,7 +177,18 @@ class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
         let pageCellRegistration = UICollectionView
             .CellRegistration<UIPageCell, String> { [weak self] cell, _, pageId in
                 guard let self, let pageStore = self.pageStore(id: pageId) else { return }
-                cell.configure(with: pageStore, fitPageWidth: self.usesFitPageWidth)
+                cell.setAllowsStampCreation(self.store.canUseStamps)
+                cell.configure(
+                    with: pageStore,
+                    fitPageWidth: self.usesFitPageWidth,
+                    showsStamps: self.store.shouldShowStamps,
+                    onCreateStamp: { [weak self] position in
+                        self?.store.send(.stampCreationRequested(pageId: pageId, position: position))
+                    },
+                    onEditStamp: { [weak self] stamp in
+                        self?.store.send(.stampEditingRequested(pageId: pageId, stamp: stamp))
+                    }
+                )
             }
         let placeholderCellRegistration = UICollectionView
             .CellRegistration<UICollectionViewCell, ReaderCollectionItem> { cell, _, _ in
@@ -341,6 +353,17 @@ class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
             collectionView.visibleCells
                 .compactMap { $0 as? UIPageCell }
                 .forEach { $0.setFitPageWidth(fitPageWidth) }
+        }
+        observe { [weak self] in
+            guard let self else { return }
+            let allowsStampCreation = store.canUseStamps
+            let showsStamps = store.shouldShowStamps
+            collectionView.visibleCells
+                .compactMap { $0 as? UIPageCell }
+                .forEach {
+                    $0.setAllowsStampCreation(allowsStampCreation)
+                    $0.setShowsStamps(showsStamps)
+                }
         }
     }
 
@@ -606,6 +629,7 @@ class UIPageCollectionController: UIViewController, UICollectionViewDelegate {
         case main
     }
 }
+// swiftlint:enable type_body_length
 
 private extension UIPageCollectionController {
     func consumePendingScrollRequestIfPossible() {
