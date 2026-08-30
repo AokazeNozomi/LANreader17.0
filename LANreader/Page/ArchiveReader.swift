@@ -29,6 +29,18 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
     }
 }
 
+public struct StampCreationTarget: Equatable, Sendable {
+    let sourceArchiveId: String
+    let sourcePageNumber: Int
+    let position: ArchiveStampPosition
+}
+
+public struct StampEditingTarget: Equatable, Sendable {
+    let stampId: String
+    let sourceArchiveId: String
+    let sourcePageNumber: Int
+}
+
 @Reducer public struct ArchiveReaderFeature: Sendable {
     private let logger = Logger(label: "ArchiveReaderFeature")
 
@@ -46,10 +58,12 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
         @SharedReader(.appStorage(SettingsKey.autoPageInterval)) var autoPageInterval = 5.0
         @Shared(.appStorage(SettingsKey.doublePageLayout)) var doublePageLayout = false
         @SharedReader(.appStorage(SettingsKey.fitPageWidth)) var fitPageWidth = false
+        @Shared(.appStorage(SettingsKey.showStamps)) var showStamps = false
         @SharedReader(.appStorage(SettingsKey.restartFinished)) var restartFinished = false
 
         var currentArchiveId = ""
         var currentPageIndex = 0
+        var spreadPairingOffset = 0
         var scrollRequest: ScrollRequest?
         var pages: IdentifiedArrayOf<PageFeature.State> = []
         var collectionScrolling = false
@@ -75,6 +89,15 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
         var sliderPreviewLoading = false
         var sliderThumbnailJobsById: [Int: String] = [:]
         var sliderReadyThumbnailPages: Set<Int> = []
+        /// Median aspect ratio of the pages measured so far, used to size pages that have not been
+        /// measured yet. Pages within an archive are near-uniform, so this converges almost immediately.
+        var estimatedPageAspectRatio: Double = ReaderPageLayout.defaultAspectRatio
+        var stampCreationTarget: StampCreationTarget?
+        var stampComment = ""
+        var stampEditingTarget: StampEditingTarget?
+        var stampEditText = ""
+        var stampRequestInFlight = false
+        var stampsSupported: Bool?
 
         var allArchives: IdentifiedArrayOf<Shared<ArchiveItem>> = []
 
@@ -130,6 +153,14 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
         var canToggleDoublePageLayout: Bool {
             !pages.isEmpty && resolvedReadDirection != .upDown && !splitImage
         }
+
+        var canUseStamps: Bool {
+            !cached && stampsSupported != false
+        }
+
+        var shouldShowStamps: Bool {
+            canUseStamps && showStamps
+        }
     }
 
     public enum Action: Equatable, BindableAction {
@@ -142,9 +173,32 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
         case setLastAutoPageIndex(Int?)
         case page(IdentifiedActionOf<PageFeature>)
         case extractArchive
+        case stampsSupportResolved(Bool?)
         case finishExtracting([ReaderExtractedPage], TankoubonDetailsMetadata?)
+        case primePageAspectRatios
+        case pageAspectRatiosPrimed([Int: Double])
         case toggleControlUi(Bool?)
         case toggleDoublePageLayout
+        case toggleStampsVisibility
+        case stampCreationRequested(pageId: String, position: ArchiveStampPosition)
+        case stampCommentChanged(String)
+        case cancelStampCreation
+        case confirmStampCreation
+        case stampCreated(
+            target: StampCreationTarget,
+            stamp: ArchiveStamp,
+            refreshedStamps: [ArchiveStamp]?
+        )
+        case stampCreationFailed(target: StampCreationTarget, content: String)
+        case stampEditingRequested(pageId: String, stamp: ArchiveStamp)
+        case stampEditTextChanged(String)
+        case cancelStampEditing
+        case confirmStampEditing
+        case confirmStampDeletion
+        case stampUpdated(target: StampEditingTarget, content: String)
+        case stampUpdateFailed(target: StampEditingTarget, content: String)
+        case stampDeleted(target: StampEditingTarget)
+        case stampDeleteFailed(target: StampEditingTarget, content: String)
         case visiblePageChanged(Int)
         case chapterSelected(Int)
         case requestJump(Int, source: ReaderNavigationSource)
@@ -194,6 +248,9 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
         case sliderPreviewThumbnailQueue
         case sliderPreviewThumbnailPolling
         case sliderPreviewLoad
+        case primePageAspectRatios
+        case stampCreation
+        case stampMutation
     }
 
     public var body: some ReducerOf<Self> {
@@ -203,7 +260,7 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
             AutomaticPageFeature()
         }
 
-        Reduce { state, action in
+        Reduce<State, Action> { (state: inout State, action: Action) -> Effect<Action> in
             switch action {
             case .loadCached:
                state.extracting = true
@@ -214,7 +271,7 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                if let content = try? FileManager.default.contentsOfDirectory(
                    at: cacheFolder, includingPropertiesForKeys: []
                ) {
-                   let pageState = content.compactMap { url in
+                   let pageState: [PageFeature.State] = content.compactMap { url in
                        let page = url.deletingPathExtension().lastPathComponent
                        if let pageNumber = Int(page) {
                            return PageFeature.State(archiveId: id, pageId: page, pageNumber: pageNumber, cached: true)
@@ -238,11 +295,15 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                        fromStart: state.fromStart,
                        restartFinishedArchive: restartFinishedArchive,
                        readDirection: state.resolvedReadDirection,
-                       doublePageLayout: state.doublePageLayout
+                       doublePageLayout: state.doublePageLayout,
+                       spreadOffset: state.spreadPairingOffset
                    )
                    state.controlUiHidden = true
                    state.extracting = false
-                   return .send(.requestJump(state.currentPageIndex, source: .initialRestore))
+                   return .merge(
+                       .send(.requestJump(state.currentPageIndex, source: .initialRestore)),
+                       .send(.primePageAspectRatios)
+                   )
                } else {
                    self.resetSliderPreviewArchiveState(state: &state)
                    state.controlUiHidden = true
@@ -257,6 +318,8 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                     state.inCache = true
                 }
                 return .run { send in
+                    let stampsSupported = await service.stampSupportForCurrentServer()
+                    await send(.stampsSupportResolved(stampsSupported))
                     let pages: [ReaderExtractedPage]
                     var tankoubonDetails: TankoubonDetailsMetadata?
                     if id.isTankoubonArchiveId {
@@ -311,6 +374,19 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                     await send(.setError(error.localizedDescription))
                     await send(.finishExtracting([], nil))
                 }
+            case let .stampsSupportResolved(isSupported):
+                state.stampsSupported = isSupported
+                guard isSupported == false else { return .none }
+                state.stampCreationTarget = nil
+                state.stampComment = ""
+                state.stampEditingTarget = nil
+                state.stampEditText = ""
+                state.stampRequestInFlight = false
+                for pageId in state.pages.ids {
+                    state.pages[id: pageId]?.stampsLoading = false
+                    state.pages[id: pageId]?.stampsLoaded = true
+                }
+                return .none
             case let .finishExtracting(pages, tankoubonDetails):
                 state.currentTankoubonDetails = tankoubonDetails
                 if !pages.isEmpty {
@@ -342,7 +418,8 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                         fromStart: state.fromStart,
                         restartFinishedArchive: restartFinishedArchive,
                         readDirection: state.resolvedReadDirection,
-                        doublePageLayout: state.doublePageLayout
+                        doublePageLayout: state.doublePageLayout,
+                        spreadOffset: state.spreadPairingOffset
                     )
                     state.currentPageIndex = pageIndexToShow
                     state.controlUiHidden = true
@@ -350,7 +427,27 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                 state.extracting = false
                 guard !state.pages.isEmpty else { return .none }
                 let initialRestore = Effect<Action>.send(.requestJump(state.currentPageIndex, source: .initialRestore))
-                return .merge(initialRestore, .send(.prepareSliderPreviewThumbnails))
+                return .merge(
+                    initialRestore,
+                    .send(.primePageAspectRatios),
+                    .send(.prepareSliderPreviewThumbnails)
+                )
+            case .primePageAspectRatios:
+                guard let folder = state.pages.first?.folder else { return .none }
+                return .run(priority: .utility) { send in
+                    let aspectRatios = imageService.storedImageAspectRatios(folderUrl: folder)
+                    guard !aspectRatios.isEmpty else { return }
+                    await send(.pageAspectRatiosPrimed(aspectRatios))
+                }
+                .cancellable(id: CancelId.primePageAspectRatios, cancelInFlight: true)
+            case let .pageAspectRatiosPrimed(aspectRatios):
+                for pageId in state.pages.ids {
+                    guard let page = state.pages[id: pageId], page.imageAspectRatio == nil else { continue }
+                    guard let aspectRatio = aspectRatios[page.pageNumber] else { continue }
+                    state.pages[id: pageId]?.imageAspectRatio = aspectRatio
+                }
+                self.updateEstimatedPageAspectRatio(state: &state)
+                return .none
             case let .toggleControlUi(show):
                 if let shouldShow = show {
                     state.controlUiHidden = shouldShow
@@ -366,14 +463,238 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
             case .toggleDoublePageLayout:
                 guard state.canToggleDoublePageLayout else { return .none }
                 let enabled = !state.doublePageLayout
+                state.spreadPairingOffset = enabled ? state.safeCurrentPageIndex % 2 : 0
                 state.$doublePageLayout.withLock { $0 = enabled }
                 let targetIndex = ReaderPositioning.canonicalPageIndex(
                     forVisibleIndex: state.currentPageIndex,
                     pageCount: state.pages.count,
                     readDirection: state.resolvedReadDirection,
-                    doublePageLayout: enabled
+                    doublePageLayout: enabled,
+                    spreadOffset: state.spreadPairingOffset
                 )
                 return .send(.requestJump(targetIndex, source: .layoutChange))
+            case .toggleStampsVisibility:
+                guard state.canUseStamps else { return .none }
+                let showsStamps = !state.showStamps
+                state.$showStamps.withLock { $0 = showsStamps }
+                return .none
+            case let .stampCreationRequested(pageId, position):
+                guard state.canUseStamps,
+                      !state.stampRequestInFlight,
+                      state.stampEditingTarget == nil,
+                      let page = state.pages[id: pageId],
+                      !page.cached,
+                      page.imageLoaded else {
+                    return .none
+                }
+                state.stampCreationTarget = StampCreationTarget(
+                    sourceArchiveId: page.sourceArchiveId,
+                    sourcePageNumber: page.sourcePageNumber,
+                    position: position
+                )
+                state.stampComment = ""
+                return .none
+            case let .stampCommentChanged(comment):
+                state.stampComment = comment
+                return .none
+            case .cancelStampCreation:
+                state.stampCreationTarget = nil
+                state.stampComment = ""
+                return .none
+            case .confirmStampCreation:
+                guard let target = state.stampCreationTarget else { return .none }
+                let draft = state.stampComment
+                let content = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !content.isEmpty else { return .none }
+                state.stampCreationTarget = nil
+                state.stampComment = ""
+                state.stampRequestInFlight = true
+                let logContext = "archive=\(target.sourceArchiveId) page=\(target.sourcePageNumber)"
+                return .run { send in
+                    do {
+                        let response = try await service.addStamp(
+                            id: target.sourceArchiveId,
+                            page: target.sourcePageNumber,
+                            content: content,
+                            position: target.position.rawValue
+                        ).value
+                        guard response.success == 1 else {
+                            logger.warning("server rejected stamp creation. \(logContext)")
+                            await send(.stampCreationFailed(target: target, content: draft))
+                            return
+                        }
+                        let stamp = ArchiveStamp(
+                            id: response.stampId,
+                            position: target.position.rawValue,
+                            content: content
+                        )
+                        let refreshedStamps: [ArchiveStamp]?
+                        do {
+                            refreshedStamps = try await service.retrieveStamps(
+                                id: target.sourceArchiveId,
+                                page: target.sourcePageNumber
+                            ).value.result
+                        } catch {
+                            logger.warning(
+                                "failed to refresh stamps after creation. \(logContext) \(error.localizedDescription)"
+                            )
+                            refreshedStamps = nil
+                        }
+                        await send(.stampCreated(
+                            target: target,
+                            stamp: stamp,
+                            refreshedStamps: refreshedStamps
+                        ))
+                    } catch {
+                        logger.warning("failed to create stamp. \(logContext) \(error.localizedDescription)")
+                        await send(.stampCreationFailed(target: target, content: draft))
+                    }
+                }
+                .cancellable(id: CancelId.stampCreation, cancelInFlight: true)
+            case let .stampCreated(target, stamp, refreshedStamps):
+                state.stampRequestInFlight = false
+                let matchingPageIds = state.pages.compactMap { page in
+                    page.sourceArchiveId == target.sourceArchiveId
+                        && page.sourcePageNumber == target.sourcePageNumber
+                        ? page.id
+                        : nil
+                }
+                guard !matchingPageIds.isEmpty else {
+                    return .none
+                }
+                for pageId in matchingPageIds {
+                    if let refreshedStamps {
+                        state.pages[id: pageId]?.stamps = refreshedStamps
+                        state.pages[id: pageId]?.stampsLoaded = true
+                        state.pages[id: pageId]?.stampsLoading = false
+                    } else {
+                        if state.pages[id: pageId]?.stamps.contains(stamp) == false {
+                            state.pages[id: pageId]?.stamps.append(stamp)
+                        }
+                        state.pages[id: pageId]?.stampsLoaded = false
+                        state.pages[id: pageId]?.stampsLoading = false
+                    }
+                }
+                state.$showStamps.withLock { $0 = true }
+                guard refreshedStamps == nil else { return .none }
+                return .merge(matchingPageIds.map { pageId in
+                    .send(.page(.element(id: pageId, action: .loadStamps)))
+                })
+            case let .stampCreationFailed(target, content):
+                state.stampRequestInFlight = false
+                state.stampCreationTarget = target
+                state.stampComment = content
+                state.errorMessage = String(localized: "archive.reader.stamp.add.failed")
+                return .none
+            case let .stampEditingRequested(pageId, stamp):
+                guard state.canUseStamps,
+                      !state.stampRequestInFlight,
+                      state.stampCreationTarget == nil,
+                      let stampId = stamp.id,
+                      !stampId.isEmpty,
+                      let page = state.pages[id: pageId],
+                      !page.cached,
+                      page.stamps.contains(where: { $0.id == stampId }) else {
+                    return .none
+                }
+                state.stampEditingTarget = StampEditingTarget(
+                    stampId: stampId,
+                    sourceArchiveId: page.sourceArchiveId,
+                    sourcePageNumber: page.sourcePageNumber
+                )
+                state.stampEditText = stamp.content
+                return .none
+            case let .stampEditTextChanged(content):
+                state.stampEditText = content
+                return .none
+            case .cancelStampEditing:
+                state.stampEditingTarget = nil
+                state.stampEditText = ""
+                return .none
+            case .confirmStampEditing:
+                guard let target = state.stampEditingTarget else { return .none }
+                let draft = state.stampEditText
+                let content = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !content.isEmpty else { return .none }
+                state.stampEditingTarget = nil
+                state.stampEditText = ""
+                state.stampRequestInFlight = true
+                return .run { send in
+                    do {
+                        let response = try await service.updateStamp(id: target.stampId, content: content).value
+                        guard response.success == 1 else {
+                            logger.warning("server rejected stamp update. stamp=\(target.stampId)")
+                            await send(.stampUpdateFailed(target: target, content: draft))
+                            return
+                        }
+                        await send(.stampUpdated(target: target, content: content))
+                    } catch {
+                        logger.warning("failed to update stamp. stamp=\(target.stampId) \(error.localizedDescription)")
+                        await send(.stampUpdateFailed(target: target, content: draft))
+                    }
+                }
+                .cancellable(id: CancelId.stampMutation, cancelInFlight: true)
+            case .confirmStampDeletion:
+                guard let target = state.stampEditingTarget else { return .none }
+                let content = state.stampEditText
+                state.stampEditingTarget = nil
+                state.stampEditText = ""
+                state.stampRequestInFlight = true
+                return .run { send in
+                    do {
+                        let response = try await service.deleteStamp(id: target.stampId).value
+                        guard response.success == 1 else {
+                            logger.warning("server rejected stamp deletion. stamp=\(target.stampId)")
+                            await send(.stampDeleteFailed(target: target, content: content))
+                            return
+                        }
+                        await send(.stampDeleted(target: target))
+                    } catch {
+                        logger.warning("failed to delete stamp. stamp=\(target.stampId) \(error.localizedDescription)")
+                        await send(.stampDeleteFailed(target: target, content: content))
+                    }
+                }
+                .cancellable(id: CancelId.stampMutation, cancelInFlight: true)
+            case let .stampUpdated(target, content):
+                state.stampRequestInFlight = false
+                for pageId in state.pages.ids {
+                    guard let page = state.pages[id: pageId],
+                          page.sourceArchiveId == target.sourceArchiveId,
+                          page.sourcePageNumber == target.sourcePageNumber,
+                          let index = page.stamps.firstIndex(where: { $0.id == target.stampId }) else {
+                        continue
+                    }
+                    let stamp = page.stamps[index]
+                    state.pages[id: pageId]?.stamps[index] = ArchiveStamp(
+                        id: stamp.id,
+                        position: stamp.position,
+                        content: content
+                    )
+                }
+                return .none
+            case let .stampUpdateFailed(target, content):
+                state.stampRequestInFlight = false
+                state.stampEditingTarget = target
+                state.stampEditText = content
+                state.errorMessage = String(localized: "archive.reader.stamp.update.failed")
+                return .none
+            case let .stampDeleted(target):
+                state.stampRequestInFlight = false
+                for pageId in state.pages.ids {
+                    guard let page = state.pages[id: pageId],
+                          page.sourceArchiveId == target.sourceArchiveId,
+                          page.sourcePageNumber == target.sourcePageNumber else {
+                        continue
+                    }
+                    state.pages[id: pageId]?.stamps.removeAll { $0.id == target.stampId }
+                }
+                return .none
+            case let .stampDeleteFailed(target, content):
+                state.stampRequestInFlight = false
+                state.stampEditingTarget = target
+                state.stampEditText = content
+                state.errorMessage = String(localized: "archive.reader.stamp.delete.failed")
+                return .none
             case let .visiblePageChanged(index):
                 guard !state.pages.isEmpty else { return .none }
                 let clampedIndex = ReaderPositioning.clampedPageIndex(index, pageCount: state.pages.count)
@@ -670,7 +991,8 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                     direction: direction,
                     pageCount: state.pages.count,
                     readDirection: state.resolvedReadDirection,
-                    doublePageLayout: state.doublePageLayout
+                    doublePageLayout: state.doublePageLayout,
+                    spreadOffset: state.spreadPairingOffset
                 ) else {
                     return .none
                 }
@@ -735,12 +1057,15 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                 return .none
             case .binding:
                 return .none
+            case .page(.element(id: _, action: .stampsLoadFailed(endpointUnavailable: true))):
+                return .send(.stampsSupportResolved(false))
             case let .page(.element(id: id, action: .storedImageResolved(shouldDisplayAsSplitPages))):
                 self.handleSplitResolution(
                     id: id,
                     shouldDisplayAsSplitPages: shouldDisplayAsSplitPages,
                     state: &state
                 )
+                self.updateEstimatedPageAspectRatio(state: &state)
                 return .none
             case .page:
                 return .none
@@ -880,6 +1205,8 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                     .cancel(id: CancelId.sliderPreviewThumbnailQueue),
                     .cancel(id: CancelId.sliderPreviewThumbnailPolling),
                     .cancel(id: CancelId.sliderPreviewLoad),
+                    .cancel(id: CancelId.stampCreation),
+                    .cancel(id: CancelId.stampMutation),
                     state.cached ? .send(.loadCached) : .send(.extractArchive)
                 )
             case .loadNextArchive:
@@ -894,6 +1221,8 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
                     .cancel(id: CancelId.sliderPreviewThumbnailQueue),
                     .cancel(id: CancelId.sliderPreviewThumbnailPolling),
                     .cancel(id: CancelId.sliderPreviewLoad),
+                    .cancel(id: CancelId.stampCreation),
+                    .cancel(id: CancelId.stampMutation),
                     state.cached ? .send(.loadCached) : .send(.extractArchive)
                 )
             }
@@ -966,6 +1295,14 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
         } else {
             PageMode.preferredSplitMode(priorityLeft: state.piorityLeft)
         }
+    }
+
+    private func updateEstimatedPageAspectRatio(state: inout State) {
+        guard let median = ReaderPageLayout.medianAspectRatio(state.pages.compactMap(\.imageAspectRatio)) else {
+            return
+        }
+        guard state.estimatedPageAspectRatio != median else { return }
+        state.estimatedPageAspectRatio = median
     }
 
     private func handleSplitResolution(
@@ -1049,6 +1386,7 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
             cached: current.cached
         )
         insertedPage.imageLoaded = true
+        insertedPage.imageAspectRatio = current.imageAspectRatio
         guard state.pages[id: insertedPage.id] == nil else { return }
 
         let leadingSplitMode = PageMode.preferredSplitMode(priorityLeft: state.piorityLeft)
@@ -1171,6 +1509,7 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
     func resetState(state: inout State) {
         state.pages = []
         state.currentPageIndex = 0
+        state.spreadPairingOffset = 0
         state.fromStart = false
         state.scrollRequest = nil
         state.collectionScrolling = false
@@ -1179,6 +1518,12 @@ public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
         state.errorMessage = ""
         state.successMessage = ""
         state.currentTankoubonDetails = nil
+        state.estimatedPageAspectRatio = ReaderPageLayout.defaultAspectRatio
+        state.stampCreationTarget = nil
+        state.stampComment = ""
+        state.stampEditingTarget = nil
+        state.stampEditText = ""
+        state.stampRequestInFlight = false
         resetSliderPreviewArchiveState(state: &state)
     }
 }
@@ -1230,6 +1575,61 @@ struct ArchiveReader: View {
         .alert(
             $store.scope(\.$alert, action: \.alert)
         )
+        .alert(
+            "archive.reader.stamp.add.title",
+            isPresented: Binding(
+                get: { store.stampCreationTarget != nil },
+                set: { isPresented in
+                    if !isPresented, store.stampCreationTarget != nil {
+                        store.send(.cancelStampCreation)
+                    }
+                }
+            )
+        ) {
+            TextField(
+                "archive.reader.stamp.text.placeholder",
+                text: Binding(
+                    get: { store.stampComment },
+                    set: { store.send(.stampCommentChanged($0)) }
+                )
+            )
+            Button("cancel", role: .cancel) {
+                store.send(.cancelStampCreation)
+            }
+            Button("save") {
+                store.send(.confirmStampCreation)
+            }
+            .disabled(store.stampComment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+        .alert(
+            "archive.reader.stamp.edit.title",
+            isPresented: Binding(
+                get: { store.stampEditingTarget != nil },
+                set: { isPresented in
+                    if !isPresented, store.stampEditingTarget != nil {
+                        store.send(.cancelStampEditing)
+                    }
+                }
+            )
+        ) {
+            TextField(
+                "archive.reader.stamp.text.placeholder",
+                text: Binding(
+                    get: { store.stampEditText },
+                    set: { store.send(.stampEditTextChanged($0)) }
+                )
+            )
+            Button("delete", role: .destructive) {
+                store.send(.confirmStampDeletion)
+            }
+            Button("cancel", role: .cancel) {
+                store.send(.cancelStampEditing)
+            }
+            Button("save") {
+                store.send(.confirmStampEditing)
+            }
+            .disabled(store.stampEditText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
         .overlay(content: {
             store.showAutoPageConfig ? AutomaticPageConfig(
                 store: store.scope(\.autoPage, action: \.autoPage)
@@ -1455,6 +1855,18 @@ struct ArchiveReader: View {
         let cacheActionRemoves = store.cached || store.inCache
 
         return Menu {
+            if store.canUseStamps {
+                Button {
+                    store.send(.toggleStampsVisibility)
+                } label: {
+                    if store.showStamps {
+                        Label("archive.reader.stamps.hide", systemImage: "mappin.slash")
+                    } else {
+                        Label("archive.reader.stamps.show", systemImage: "mappin")
+                    }
+                }
+            }
+
             Button {
                 store.send(.setThumbnail)
             } label: {

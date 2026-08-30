@@ -43,6 +43,61 @@ struct ArchiveExtractResponse: Decodable {
     let pages: [String]
 }
 
+struct ArchiveStampsResponse: Decodable, Equatable, Sendable {
+    let result: [ArchiveStamp]
+}
+
+struct AddStampResponse: Decodable, Equatable, Sendable {
+    let stampId: String?
+    let success: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case stampId = "stamp_id"
+        case success
+    }
+}
+
+public struct ArchiveStamp: Decodable, Equatable, Sendable {
+    let id: String?
+    let position: String
+    let content: String
+
+    var normalizedPosition: ArchiveStampPosition? {
+        ArchiveStampPosition(rawValue: position)
+    }
+}
+
+public struct ArchiveStampPosition: Equatable, Sendable {
+    let horizontalPercentage: Double
+    let verticalPercentage: Double
+
+    init(horizontalPercentage: Double, verticalPercentage: Double) {
+        self.horizontalPercentage = horizontalPercentage
+        self.verticalPercentage = verticalPercentage
+    }
+
+    init?(rawValue: String) {
+        let components = rawValue.split(separator: ",", omittingEmptySubsequences: false)
+        guard components.count == 2,
+              let horizontalPercentage = Double(components[0].trimmingCharacters(in: .whitespaces)),
+              let verticalPercentage = Double(components[1].trimmingCharacters(in: .whitespaces)),
+              horizontalPercentage.isFinite,
+              verticalPercentage.isFinite,
+              (0...100).contains(horizontalPercentage),
+              (0...100).contains(verticalPercentage) else {
+            return nil
+        }
+        self.init(
+            horizontalPercentage: horizontalPercentage,
+            verticalPercentage: verticalPercentage
+        )
+    }
+
+    var rawValue: String {
+        "\(horizontalPercentage),\(verticalPercentage)"
+    }
+}
+
 struct ArchiveCategoriesResponse: Decodable {
     let archives: [String]
     let id: String

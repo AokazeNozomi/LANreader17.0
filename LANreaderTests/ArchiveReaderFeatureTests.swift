@@ -12,6 +12,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
         UserDefaults.standard.removeObject(forKey: SettingsKey.readDirection)
         UserDefaults.standard.removeObject(forKey: SettingsKey.doublePageLayout)
         UserDefaults.standard.removeObject(forKey: SettingsKey.fitPageWidth)
+        UserDefaults.standard.removeObject(forKey: SettingsKey.showStamps)
         UserDefaults.standard.removeObject(forKey: SettingsKey.autoPageInterval)
         UserDefaults.standard.removeObject(forKey: SettingsKey.splitWideImage)
         UserDefaults.standard.removeObject(forKey: SettingsKey.splitPiorityLeft)
@@ -37,22 +38,6 @@ final class ArchiveReaderFeatureTests: XCTestCase {
     }
 
     @MainActor
-    func testReadSettingsEnablingDoublePageLayoutDisablesSplitAndKeepsPriority() async {
-        configureReaderDefaults(
-            splitWideImage: true,
-            splitPiorityLeft: true
-        )
-        let store = TestStore(initialState: ReadSettingsFeature.State()) {
-            ReadSettingsFeature()
-        }
-
-        await store.send(.doublePageLayoutChanged(true)) {
-            $0.$splitWideImage.withLock { $0 = false }
-            $0.$doublePageLayout.withLock { $0 = true }
-        }
-    }
-
-    @MainActor
     func testReadSettingsDisablingSplitKeepsPriority() async {
         configureReaderDefaults(
             splitWideImage: true,
@@ -74,6 +59,773 @@ final class ArchiveReaderFeatureTests: XCTestCase {
             1.5
         )
         XCTAssertNil(UIPageCell.fitWidthAspectRatio(for: CGSize(width: 0, height: 1_500)))
+    }
+
+    func testStampPositionParsesNormalizedCoordinates() {
+        XCTAssertEqual(
+            ArchiveStampPosition(rawValue: " 12.5,100 "),
+            ArchiveStampPosition(rawValue: "12.5,100")
+        )
+        XCTAssertNil(ArchiveStampPosition(rawValue: "-1,50"))
+        XCTAssertNil(ArchiveStampPosition(rawValue: "50,101"))
+        XCTAssertNil(ArchiveStampPosition(rawValue: "not-a-position"))
+    }
+
+    func testStampPositioningMapsStampsOntoSplitPageHalves() {
+        let leftPosition = ArchiveStampPosition(rawValue: "25,30")!
+        let rightPosition = ArchiveStampPosition(rawValue: "75,30")!
+
+        XCTAssertEqual(
+            StampOverlayPositioning.displayedPosition(leftPosition, pageMode: .left),
+            ArchiveStampPosition(rawValue: "50,30")
+        )
+        XCTAssertNil(StampOverlayPositioning.displayedPosition(rightPosition, pageMode: .left))
+        XCTAssertEqual(
+            StampOverlayPositioning.displayedPosition(rightPosition, pageMode: .right),
+            ArchiveStampPosition(rawValue: "50,30")
+        )
+        XCTAssertNil(StampOverlayPositioning.displayedPosition(leftPosition, pageMode: .right))
+    }
+
+    func testStampPositioningUsesRenderedAspectFitImageRect() {
+        XCTAssertEqual(
+            StampOverlayPositioning.aspectFitRect(
+                imageSize: CGSize(width: 1_000, height: 500),
+                in: CGRect(x: 0, y: 0, width: 400, height: 400)
+            ),
+            CGRect(x: 0, y: 100, width: 400, height: 200)
+        )
+    }
+
+    func testStampPositioningMapsLongPressToSourceCoordinates() {
+        let imageSize = CGSize(width: 1_000, height: 500)
+        let bounds = CGRect(x: 0, y: 0, width: 400, height: 400)
+        let point = CGPoint(x: 100, y: 150)
+
+        XCTAssertEqual(
+            StampOverlayPositioning.sourcePosition(
+                at: point,
+                pageMode: .normal,
+                imageSize: imageSize,
+                in: bounds
+            ),
+            ArchiveStampPosition(rawValue: "25,25")
+        )
+        XCTAssertNil(
+            StampOverlayPositioning.sourcePosition(
+                at: CGPoint(x: 100, y: 50),
+                pageMode: .normal,
+                imageSize: imageSize,
+                in: bounds
+            )
+        )
+    }
+
+    func testStampPositioningMapsSplitLongPressToSourceCoordinates() {
+        let imageSize = CGSize(width: 1_000, height: 500)
+        let bounds = CGRect(x: 0, y: 0, width: 400, height: 400)
+        let point = CGPoint(x: 100, y: 150)
+
+        XCTAssertEqual(
+            StampOverlayPositioning.sourcePosition(
+                at: point,
+                pageMode: .left,
+                imageSize: imageSize,
+                in: bounds
+            ),
+            ArchiveStampPosition(rawValue: "12.5,25")
+        )
+        XCTAssertEqual(
+            StampOverlayPositioning.sourcePosition(
+                at: point,
+                pageMode: .right,
+                imageSize: imageSize,
+                in: bounds
+            ),
+            ArchiveStampPosition(rawValue: "62.5,25")
+        )
+    }
+
+    @MainActor
+    func testToggleStampsVisibility() async {
+        let state = makeState()
+        state.$showStamps = Shared(value: false)
+        let store = makeTestStore(initialState: state)
+
+        await store.send(.toggleStampsVisibility) {
+            $0.$showStamps.withLock { $0 = true }
+        }
+    }
+
+    @MainActor
+    func testUnsupportedServerDisablesStampControlsWithoutChangingPreference() async {
+        var state = makeState()
+        state.$showStamps = Shared(value: true)
+        state.stampsSupported = false
+        var page = PageFeature.State(archiveId: "archive", pageId: "1", pageNumber: 1)
+        page.imageLoaded = true
+        state.pages = [page]
+        let store = makeTestStore(initialState: state)
+
+        XCTAssertFalse(store.state.canUseStamps)
+        XCTAssertFalse(store.state.shouldShowStamps)
+        await store.send(.toggleStampsVisibility)
+        await store.send(.stampCreationRequested(
+            pageId: page.id,
+            position: ArchiveStampPosition(rawValue: "50,50")!
+        ))
+        XCTAssertTrue(store.state.showStamps)
+        XCTAssertNil(store.state.stampCreationTarget)
+    }
+
+    @MainActor
+    func testUnavailableStampsEndpointDisablesStampsForReaderSession() async {
+        var state = makeState()
+        state.$showStamps = Shared(value: true)
+        var firstPage = PageFeature.State(archiveId: "archive", pageId: "1", pageNumber: 1)
+        firstPage.stampsLoading = true
+        let secondPage = PageFeature.State(archiveId: "archive", pageId: "2", pageNumber: 2)
+        state.pages = [firstPage, secondPage]
+        let store = makeTestStore(initialState: state)
+
+        await store.send(.page(.element(
+            id: firstPage.id,
+            action: .stampsLoadFailed(endpointUnavailable: true)
+        ))) {
+            $0.pages[id: firstPage.id]?.stampsLoading = false
+            $0.pages[id: firstPage.id]?.stampsLoaded = true
+        }
+        await store.receive(.stampsSupportResolved(false)) {
+            $0.stampsSupported = false
+            $0.pages[id: secondPage.id]?.stampsLoaded = true
+        }
+        XCTAssertTrue(store.state.showStamps)
+        XCTAssertFalse(store.state.shouldShowStamps)
+    }
+
+    @MainActor
+    func testCachedPageDoesNotLoadStampsFromServer() async {
+        let store = TestStore(
+            initialState: PageFeature.State(
+                archiveId: "archive",
+                pageId: "1",
+                pageNumber: 1,
+                cached: true
+            )
+        ) {
+            PageFeature()
+        }
+
+        await store.send(.loadStamps)
+    }
+
+    @MainActor
+    func testPageLoadsStampsUsingSourceArchiveAndPage() async throws {
+        try await configureVerifiedClient()
+        let stamp = ArchiveStamp(id: "stamp", position: "12,34", content: "Comment")
+        stubArchiveStamps(archiveId: "source", page: 4)
+        let store = TestStore(
+            initialState: PageFeature.State(
+                archiveId: "tank",
+                pageId: "page",
+                pageNumber: 8,
+                sourceArchiveId: "source",
+                sourcePageNumber: 4
+            )
+        ) {
+            PageFeature()
+        }
+
+        await store.send(.loadStamps) {
+            $0.stampsLoading = true
+        }
+        await store.receive(.stampsLoaded([stamp])) {
+            $0.stamps = [stamp]
+            $0.stampsLoading = false
+            $0.stampsLoaded = true
+        }
+    }
+
+    @MainActor
+    func testPageRetriesStampsAfterTransientFailure() async throws {
+        try await configureVerifiedClient()
+        stubArchiveStampsFailure(archiveId: "archive", page: 1, statusCode: 500)
+        let store = TestStore(
+            initialState: PageFeature.State(
+                archiveId: "archive",
+                pageId: "1",
+                pageNumber: 1
+            )
+        ) {
+            PageFeature()
+        }
+
+        await store.send(.loadStamps) {
+            $0.stampsLoading = true
+        }
+        await store.receive(.stampsLoadFailed(endpointUnavailable: false)) {
+            $0.stampsLoading = false
+        }
+
+        HTTPStubs.removeAllStubs()
+        stubArchiveStamps(archiveId: "archive", page: 1)
+        await store.send(.loadStamps) {
+            $0.stampsLoading = true
+        }
+        await store.receive(.stampsLoaded([
+            ArchiveStamp(id: "stamp", position: "12,34", content: "Comment")
+        ])) {
+            $0.stamps = [ArchiveStamp(id: "stamp", position: "12,34", content: "Comment")]
+            $0.stampsLoading = false
+            $0.stampsLoaded = true
+        }
+    }
+
+    @MainActor
+    func testPageDoesNotRetryUnavailableStampsEndpoint() async throws {
+        try await configureVerifiedClient()
+        stubArchiveStampsFailure(archiveId: "archive", page: 1, statusCode: 404)
+        let store = TestStore(
+            initialState: PageFeature.State(
+                archiveId: "archive",
+                pageId: "1",
+                pageNumber: 1
+            )
+        ) {
+            PageFeature()
+        }
+
+        await store.send(.loadStamps) {
+            $0.stampsLoading = true
+        }
+        await store.receive(.stampsLoadFailed(endpointUnavailable: true)) {
+            $0.stampsLoading = false
+            $0.stampsLoaded = true
+        }
+        await store.send(.loadStamps)
+    }
+
+    @MainActor
+    func testCreateStampUsesSourcePageAndShowsRefreshedStamps() async throws {
+        configureReaderDefaults()
+        try await configureVerifiedClient()
+
+        let position = ArchiveStampPosition(rawValue: "25,30")!
+        let stamp = ArchiveStamp(id: "created-stamp", position: position.rawValue, content: "New comment")
+        stubAddArchiveStamp(archiveId: "source", page: 4, content: "New comment", position: position.rawValue)
+        stubArchiveStamps(archiveId: "source", page: 4, stamps: [stamp])
+
+        var initialState = makeState(archiveId: "TANK_test")
+        initialState.$showStamps = Shared(value: false)
+        var page = PageFeature.State(
+            archiveId: "TANK_test", pageId: "page", pageNumber: 8,
+            sourceArchiveId: "source", sourcePageNumber: 4,
+            pageMode: .left
+        )
+        page.imageLoaded = true
+        var siblingPage = PageFeature.State(
+            archiveId: "TANK_test", pageId: "page", pageNumber: 8,
+            sourceArchiveId: "source", sourcePageNumber: 4,
+            pageMode: .right
+        )
+        siblingPage.imageLoaded = true
+        initialState.pages = [page, siblingPage]
+        let target = StampCreationTarget(
+            sourceArchiveId: "source", sourcePageNumber: 4, position: position
+        )
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.stampCreationRequested(pageId: page.id, position: position)) {
+            $0.stampCreationTarget = target
+        }
+        await store.send(.stampCommentChanged("  New comment\n")) {
+            $0.stampComment = "  New comment\n"
+        }
+        await store.send(.confirmStampCreation) {
+            $0.stampCreationTarget = nil
+            $0.stampComment = ""
+            $0.stampRequestInFlight = true
+        }
+        await store.receive(.stampCreated(
+            target: target,
+            stamp: stamp,
+            refreshedStamps: [stamp]
+        )) {
+            $0.stampRequestInFlight = false
+            $0.pages[id: page.id]?.stamps = [stamp]
+            $0.pages[id: page.id]?.stampsLoaded = true
+            $0.pages[id: siblingPage.id]?.stamps = [stamp]
+            $0.pages[id: siblingPage.id]?.stampsLoaded = true
+            $0.$showStamps.withLock { $0 = true }
+        }
+    }
+
+    @MainActor
+    func testEditStampUpdatesExistingStampText() async throws {
+        configureReaderDefaults()
+        try await configureVerifiedClient()
+
+        let stamp = ArchiveStamp(id: "stamp", position: "25,30", content: "Original text")
+        stubUpdateArchiveStamp(stampId: "stamp", content: "Updated text")
+        var initialState = makeState()
+        var page = PageFeature.State(
+            archiveId: "archive",
+            pageId: "1",
+            pageNumber: 1,
+            pageMode: .left
+        )
+        page.imageLoaded = true
+        page.stamps = [stamp]
+        page.stampsLoaded = true
+        var siblingPage = PageFeature.State(
+            archiveId: "archive",
+            pageId: "1",
+            pageNumber: 1,
+            pageMode: .right
+        )
+        siblingPage.imageLoaded = true
+        siblingPage.stamps = [stamp]
+        siblingPage.stampsLoaded = true
+        initialState.pages = [page, siblingPage]
+        let target = StampEditingTarget(
+            stampId: "stamp", sourceArchiveId: "archive", sourcePageNumber: 1
+        )
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.stampEditingRequested(pageId: page.id, stamp: stamp)) {
+            $0.stampEditingTarget = target
+            $0.stampEditText = "Original text"
+        }
+        await store.send(.stampEditTextChanged("  Updated text\n")) {
+            $0.stampEditText = "  Updated text\n"
+        }
+        await store.send(.confirmStampEditing) {
+            $0.stampEditingTarget = nil
+            $0.stampEditText = ""
+            $0.stampRequestInFlight = true
+        }
+        await store.receive(.stampUpdated(target: target, content: "Updated text")) {
+            $0.stampRequestInFlight = false
+            $0.pages[id: page.id]?.stamps = [
+                ArchiveStamp(id: "stamp", position: "25,30", content: "Updated text")
+            ]
+            $0.pages[id: siblingPage.id]?.stamps = [
+                ArchiveStamp(id: "stamp", position: "25,30", content: "Updated text")
+            ]
+        }
+    }
+
+    @MainActor
+    func testDeleteStampRemovesExistingStamp() async throws {
+        configureReaderDefaults()
+        try await configureVerifiedClient()
+
+        let stamp = ArchiveStamp(id: "stamp", position: "25,30", content: "Delete me")
+        stubDeleteArchiveStamp(stampId: "stamp")
+        var initialState = makeState()
+        var page = PageFeature.State(archiveId: "archive", pageId: "1", pageNumber: 1)
+        page.imageLoaded = true
+        page.stamps = [stamp]
+        page.stampsLoaded = true
+        initialState.pages = [page]
+        let target = StampEditingTarget(
+            stampId: "stamp",
+            sourceArchiveId: "archive",
+            sourcePageNumber: 1
+        )
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.stampEditingRequested(pageId: page.id, stamp: stamp)) {
+            $0.stampEditingTarget = target
+            $0.stampEditText = "Delete me"
+        }
+        await store.send(.confirmStampDeletion) {
+            $0.stampEditingTarget = nil
+            $0.stampEditText = ""
+            $0.stampRequestInFlight = true
+        }
+        await store.receive(.stampDeleted(target: target)) {
+            $0.stampRequestInFlight = false
+            $0.pages[id: page.id]?.stamps = []
+        }
+    }
+
+    @MainActor
+    func testCreateStampFailureRestoresDraft() async throws {
+        configureReaderDefaults()
+        try await configureVerifiedClient()
+
+        let position = ArchiveStampPosition(rawValue: "25,30")!
+        stubAddArchiveStamp(
+            archiveId: "archive",
+            page: 1,
+            content: "Keep this text",
+            position: position.rawValue,
+            success: 0
+        )
+        var initialState = makeState()
+        var page = PageFeature.State(archiveId: "archive", pageId: "1", pageNumber: 1)
+        page.imageLoaded = true
+        initialState.pages = [page]
+        let target = StampCreationTarget(
+            sourceArchiveId: "archive",
+            sourcePageNumber: 1,
+            position: position
+        )
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.stampCreationRequested(pageId: page.id, position: position)) {
+            $0.stampCreationTarget = target
+        }
+        await store.send(.stampCommentChanged("  Keep this text\n")) {
+            $0.stampComment = "  Keep this text\n"
+        }
+        await store.send(.confirmStampCreation) {
+            $0.stampCreationTarget = nil
+            $0.stampComment = ""
+            $0.stampRequestInFlight = true
+        }
+        await store.receive(.stampCreationFailed(target: target, content: "  Keep this text\n")) {
+            $0.stampCreationTarget = target
+            $0.stampComment = "  Keep this text\n"
+            $0.stampRequestInFlight = false
+            $0.errorMessage = String(localized: "archive.reader.stamp.add.failed")
+        }
+    }
+
+    @MainActor
+    func testEditStampFailureRestoresDraft() async throws {
+        configureReaderDefaults()
+        try await configureVerifiedClient()
+
+        let stamp = ArchiveStamp(id: "stamp", position: "25,30", content: "Original text")
+        stubUpdateArchiveStamp(stampId: "stamp", content: "Keep edit", success: 0)
+        var initialState = makeState()
+        var page = PageFeature.State(archiveId: "archive", pageId: "1", pageNumber: 1)
+        page.imageLoaded = true
+        page.stamps = [stamp]
+        initialState.pages = [page]
+        let target = StampEditingTarget(
+            stampId: "stamp",
+            sourceArchiveId: "archive",
+            sourcePageNumber: 1
+        )
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.stampEditingRequested(pageId: page.id, stamp: stamp)) {
+            $0.stampEditingTarget = target
+            $0.stampEditText = "Original text"
+        }
+        await store.send(.stampEditTextChanged("  Keep edit\n")) {
+            $0.stampEditText = "  Keep edit\n"
+        }
+        await store.send(.confirmStampEditing) {
+            $0.stampEditingTarget = nil
+            $0.stampEditText = ""
+            $0.stampRequestInFlight = true
+        }
+        await store.receive(.stampUpdateFailed(target: target, content: "  Keep edit\n")) {
+            $0.stampEditingTarget = target
+            $0.stampEditText = "  Keep edit\n"
+            $0.stampRequestInFlight = false
+            $0.errorMessage = String(localized: "archive.reader.stamp.update.failed")
+        }
+    }
+
+    @MainActor
+    func testDeleteStampFailureRestoresEditor() async throws {
+        configureReaderDefaults()
+        try await configureVerifiedClient()
+
+        let stamp = ArchiveStamp(id: "stamp", position: "25,30", content: "Keep stamp")
+        stubDeleteArchiveStamp(stampId: "stamp", success: 0)
+        var initialState = makeState()
+        var page = PageFeature.State(archiveId: "archive", pageId: "1", pageNumber: 1)
+        page.imageLoaded = true
+        page.stamps = [stamp]
+        initialState.pages = [page]
+        let target = StampEditingTarget(
+            stampId: "stamp",
+            sourceArchiveId: "archive",
+            sourcePageNumber: 1
+        )
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.stampEditingRequested(pageId: page.id, stamp: stamp)) {
+            $0.stampEditingTarget = target
+            $0.stampEditText = "Keep stamp"
+        }
+        await store.send(.confirmStampDeletion) {
+            $0.stampEditingTarget = nil
+            $0.stampEditText = ""
+            $0.stampRequestInFlight = true
+        }
+        await store.receive(.stampDeleteFailed(target: target, content: "Keep stamp")) {
+            $0.stampEditingTarget = target
+            $0.stampEditText = "Keep stamp"
+            $0.stampRequestInFlight = false
+            $0.errorMessage = String(localized: "archive.reader.stamp.delete.failed")
+        }
+    }
+
+    @MainActor
+    func testCachedReaderDoesNotOfferStampCreation() async {
+        var initialState = makeState(cached: true)
+        var page = PageFeature.State(
+            archiveId: "archive",
+            pageId: "1",
+            pageNumber: 1,
+            pageMode: .normal,
+            cached: true
+        )
+        page.imageLoaded = true
+        initialState.pages = [page]
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.stampCreationRequested(
+            pageId: page.id,
+            position: ArchiveStampPosition(rawValue: "50,50")!
+        ))
+    }
+
+    @MainActor
+    func testCachedReaderDoesNotOfferStampEditing() async {
+        let stamp = ArchiveStamp(id: "stamp", position: "50,50", content: "Offline")
+        var initialState = makeState(cached: true)
+        var page = PageFeature.State(
+            archiveId: "archive",
+            pageId: "1",
+            pageNumber: 1,
+            cached: true
+        )
+        page.imageLoaded = true
+        page.stamps = [stamp]
+        initialState.pages = [page]
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.stampEditingRequested(pageId: page.id, stamp: stamp))
+    }
+
+    @MainActor
+    func testUIPageLongPressRequestsStampAtRenderedImagePosition() async throws {
+        configureReaderDefaults()
+
+        var initialState = makeState(progress: 1)
+        var page = PageFeature.State(
+            archiveId: "archive",
+            pageId: "1",
+            pageNumber: 1,
+            pageMode: .normal
+        )
+        page.imageLoaded = true
+        initialState.pages = [page]
+
+        let store = Store(initialState: initialState) {
+            ArchiveReaderFeature()
+        } withDependencies: {
+            $0.continuousClock = ImmediateClock()
+        }
+        let controller = UIPageCollectionController(store: store)
+
+        controller.loadViewIfNeeded()
+        controller.view.frame = CGRect(x: 0, y: 0, width: 320, height: 480)
+        controller.view.layoutIfNeeded()
+        await Task.yield()
+        await Task.yield()
+        controller.collectionView.layoutIfNeeded()
+
+        let cell = try XCTUnwrap(controller.collectionView.visibleCells.first as? UIPageCell)
+        cell.requestStampCreation(at: CGPoint(x: cell.bounds.midX, y: cell.bounds.midY))
+
+        XCTAssertEqual(
+            store.stampCreationTarget,
+            StampCreationTarget(
+                sourceArchiveId: "archive",
+                sourcePageNumber: 1,
+                position: ArchiveStampPosition(rawValue: "50,50")!
+            )
+        )
+    }
+
+    @MainActor
+    func testUIPageLongPressDoesNotRequestStampForUnsupportedServer() async throws {
+        configureReaderDefaults()
+
+        var initialState = makeState(progress: 1)
+        initialState.stampsSupported = false
+        var page = PageFeature.State(
+            archiveId: "archive",
+            pageId: "1",
+            pageNumber: 1,
+            pageMode: .normal
+        )
+        page.imageLoaded = true
+        initialState.pages = [page]
+
+        let store = Store(initialState: initialState) {
+            ArchiveReaderFeature()
+        } withDependencies: {
+            $0.continuousClock = ImmediateClock()
+        }
+        let controller = UIPageCollectionController(store: store)
+
+        controller.loadViewIfNeeded()
+        controller.view.frame = CGRect(x: 0, y: 0, width: 320, height: 480)
+        controller.view.layoutIfNeeded()
+        await Task.yield()
+        await Task.yield()
+        controller.collectionView.layoutIfNeeded()
+
+        let cell = try XCTUnwrap(controller.collectionView.visibleCells.first as? UIPageCell)
+        cell.requestStampCreation(at: CGPoint(x: cell.bounds.midX, y: cell.bounds.midY))
+
+        XCTAssertNil(store.stampCreationTarget)
+    }
+
+    @MainActor
+    func testUIStampMarkerLongPressIsWiredToEditing() async throws {
+        configureReaderDefaults()
+
+        let stamp = ArchiveStamp(id: "stamp", position: "50,50", content: "Editable")
+        var initialState = makeState(progress: 1)
+        initialState.$showStamps = Shared(value: true)
+        var page = PageFeature.State(archiveId: "archive", pageId: "1", pageNumber: 1)
+        page.imageLoaded = true
+        page.stamps = [stamp]
+        page.stampsLoaded = true
+        initialState.pages = [page]
+
+        let store = Store(initialState: initialState) {
+            ArchiveReaderFeature()
+        } withDependencies: {
+            $0.continuousClock = ImmediateClock()
+        }
+        let controller = UIPageCollectionController(store: store)
+
+        controller.loadViewIfNeeded()
+        controller.view.frame = CGRect(x: 0, y: 0, width: 320, height: 480)
+        controller.view.layoutIfNeeded()
+        await Task.yield()
+        await Task.yield()
+        controller.collectionView.layoutIfNeeded()
+
+        let cell = try XCTUnwrap(controller.collectionView.visibleCells.first as? UIPageCell)
+        let marker = try XCTUnwrap(stampMarker(in: cell, comment: "Editable"))
+        XCTAssertTrue(marker.gestureRecognizers?.contains { $0 is UILongPressGestureRecognizer } == true)
+        let expandedHitPoint = marker.convert(
+            CGPoint(x: -5, y: marker.bounds.midY),
+            to: cell
+        )
+        XCTAssertTrue(cell.hitTest(expandedHitPoint, with: nil) === marker)
+
+        cell.requestStampEditing(for: stamp)
+
+        XCTAssertEqual(
+            store.stampEditingTarget,
+            StampEditingTarget(
+                stampId: "stamp",
+                sourceArchiveId: "archive",
+                sourcePageNumber: 1
+            )
+        )
+        XCTAssertEqual(store.stampEditText, "Editable")
+    }
+
+    @MainActor
+    func testUIPageCollectionShowsLoadsAndClearsStampComments() async throws {
+        configureReaderDefaults()
+        try await configureVerifiedClient()
+        stubArchiveStamps(archiveId: "archive", page: 1)
+
+        var initialState = makeState(progress: 1)
+        initialState.$showStamps = Shared(value: false)
+        var page = PageFeature.State(
+            archiveId: "archive",
+            pageId: "1",
+            pageNumber: 1
+        )
+        page.imageLoaded = true
+        initialState.pages = [page]
+
+        let store = Store(initialState: initialState) {
+            ArchiveReaderFeature()
+        } withDependencies: {
+            $0.continuousClock = ImmediateClock()
+        }
+        let controller = UIPageCollectionController(store: store)
+
+        controller.loadViewIfNeeded()
+        controller.view.frame = CGRect(x: 0, y: 0, width: 320, height: 480)
+        controller.view.layoutIfNeeded()
+        await Task.yield()
+        await Task.yield()
+        controller.collectionView.layoutIfNeeded()
+
+        let cell = try XCTUnwrap(controller.collectionView.visibleCells.first as? UIPageCell)
+        XCTAssertNil(stampMarker(in: cell, comment: "Comment"))
+
+        await store.send(.toggleStampsVisibility).finish()
+        await waitForStampsToLoad(store, pageId: "1")
+        controller.view.layoutIfNeeded()
+        controller.collectionView.layoutIfNeeded()
+
+        let renderedMarker = await waitForStampMarker(in: cell, comment: "Comment")
+        let marker = try XCTUnwrap(renderedMarker)
+        XCTAssertFalse(isEffectivelyHidden(marker))
+
+        marker.sendActions(for: .touchUpInside)
+        marker.superview?.layoutIfNeeded()
+        let comment = try XCTUnwrap(stampComment(in: cell, text: "Comment"))
+        XCTAssertFalse(isEffectivelyHidden(comment))
+
+        await store.send(.toggleStampsVisibility).finish()
+        XCTAssertTrue(isEffectivelyHidden(marker))
+        XCTAssertTrue(isEffectivelyHidden(comment))
+
+        cell.prepareForReuse()
+        XCTAssertNil(cell.store)
+        XCTAssertNil(stampMarker(in: cell, comment: "Comment"))
+        XCTAssertNil(stampComment(in: cell, text: "Comment"))
+    }
+
+    func testReaderPageLayoutValidatedAspectRatio() {
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(nil), ReaderPageLayout.defaultAspectRatio)
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(0), ReaderPageLayout.defaultAspectRatio)
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(-1), ReaderPageLayout.defaultAspectRatio)
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(.nan), ReaderPageLayout.defaultAspectRatio)
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(.infinity), ReaderPageLayout.defaultAspectRatio)
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(0.01), 0.01)
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(100), 100)
+        XCTAssertEqual(ReaderPageLayout.validatedAspectRatio(1.6), 1.6)
+    }
+
+    func testReaderPageLayoutAspectRatioForSize() {
+        XCTAssertEqual(ReaderPageLayout.aspectRatio(for: CGSize(width: 1_000, height: 1_400)), 1.4)
+        XCTAssertNil(ReaderPageLayout.aspectRatio(for: CGSize(width: 0, height: 1_400)))
+        XCTAssertNil(ReaderPageLayout.aspectRatio(for: CGSize(width: 1_000, height: 0)))
+    }
+
+    func testReaderPageLayoutSplitAspectRatioDoublesSource() {
+        // A split page shows half the source width at the same height.
+        XCTAssertEqual(ReaderPageLayout.splitAspectRatio(for: 0.7), 1.4)
+    }
+
+    func testReaderPageLayoutMedianAspectRatio() {
+        XCTAssertNil(ReaderPageLayout.medianAspectRatio([]))
+        XCTAssertNil(ReaderPageLayout.medianAspectRatio([0, -1, .nan]))
+        XCTAssertEqual(ReaderPageLayout.medianAspectRatio([1.5]), 1.5)
+        XCTAssertEqual(ReaderPageLayout.medianAspectRatio([1.8, 1.2, 1.5]), 1.5)
+        XCTAssertEqual(ReaderPageLayout.medianAspectRatio([1.0, 2.0, 1.4, 1.6]), 1.6)
+    }
+
+    func testReaderPageLayoutItemHeight() {
+        XCTAssertEqual(ReaderPageLayout.itemHeight(width: 100, aspectRatio: 1.4), 140)
+        XCTAssertEqual(ReaderPageLayout.itemHeight(width: 100, aspectRatio: 1.406), 141)
+        // Long-strip webtoon pages must keep their full-width rendered height.
+        XCTAssertEqual(ReaderPageLayout.itemHeight(width: 100, aspectRatio: 20), 2_000)
+        // Unmeasured pages fall back to the default ratio rather than collapsing to zero height.
+        XCTAssertEqual(ReaderPageLayout.itemHeight(width: 100, aspectRatio: nil), 140)
+        XCTAssertEqual(ReaderPageLayout.itemHeight(width: 0, aspectRatio: 1.4), 0)
     }
 
     func testReaderPositioningFinishedMath() {
@@ -472,6 +1224,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued([readyThumbnailQueueResult()])
@@ -499,6 +1252,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued([readyThumbnailQueueResult()])
@@ -525,6 +1279,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued([readyThumbnailQueueResult()])
@@ -553,6 +1308,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued([readyThumbnailQueueResult()])
@@ -580,6 +1336,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued([readyThumbnailQueueResult()])
@@ -607,6 +1364,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued([readyThumbnailQueueResult()])
@@ -634,6 +1392,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued([readyThumbnailQueueResult()])
@@ -666,6 +1425,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
         await store.send(.extractArchive) {
             $0.extracting = true
         }
+        await store.receive(.stampsSupportResolved(false)) { $0.stampsSupported = false }
         await store.receive(
             .finishExtracting(
                 extractedPages,
@@ -690,6 +1450,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
         await store.receive(.prepareSliderPreviewThumbnails)
         await store.receive(
             .sliderPreviewThumbnailsQueued(readyThumbnailQueueResults(for: sourceArchives))
@@ -943,6 +1704,23 @@ final class ArchiveReaderFeatureTests: XCTestCase {
     }
 
     @MainActor
+    func testNavigateNextAtFinalEvenSpreadDoesNothing() async {
+        configureReaderDefaults(doublePageLayout: true)
+        var initialState = makeState(
+            progress: 6,
+            readDirection: .leftRight,
+            doublePageLayout: true
+        )
+        initialState.pages = makePageStates(count: 6)
+        initialState.currentPageIndex = 5
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.navigate(.next, source: .tap))
+
+        XCTAssertNil(store.state.scrollRequest)
+    }
+
+    @MainActor
     func testNavigatePreviousUsesCanonicalDoublePageIndex() async {
         configureReaderDefaults(
             readDirection: .rightLeft,
@@ -1013,6 +1791,41 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 source: .slider,
                 animated: false
             )
+        }
+    }
+
+    @MainActor
+    func testStaleScrollRequestAcknowledgementKeepsNewerRequest() async {
+        configureReaderDefaults()
+        var initialState = makeState(progress: 2)
+        initialState.pages = makePageStates(count: 4)
+        initialState.currentPageIndex = 1
+        let store = makeTestStore(initialState: initialState)
+        let firstRequest = makeScrollRequest(
+            id: 0,
+            targetPageIndex: 1,
+            source: .slider,
+            animated: false
+        )
+        let newerRequest = makeScrollRequest(
+            id: 1,
+            targetPageIndex: 2,
+            source: .chapter,
+            animated: false
+        )
+
+        await store.send(.requestJump(1, source: .slider)) {
+            $0.scrollRequest = firstRequest
+        }
+        await store.send(.requestJump(2, source: .chapter)) {
+            $0.scrollRequest = newerRequest
+        }
+
+        await store.send(.scrollRequestHandled(incrementingUUID(0)))
+        XCTAssertEqual(store.state.scrollRequest, newerRequest)
+
+        await store.send(.scrollRequestHandled(incrementingUUID(1))) {
+            $0.scrollRequest = nil
         }
     }
 
@@ -1109,6 +1922,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
     }
 
     @MainActor
@@ -1148,6 +1962,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
     }
 
     @MainActor
@@ -1193,6 +2008,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 animated: false
             )
         }
+        await store.receive(.primePageAspectRatios)
     }
 
     func testArchiveCachePersistsChapters() throws {
@@ -1292,12 +2108,10 @@ final class ArchiveReaderFeatureTests: XCTestCase {
             lastUpdate: Date(timeIntervalSince1970: 1)
         )
         try database.saveCache(&cache)
-        let clock = TestClock()
         let store = TestStore(initialState: CacheFeature.State()) {
             CacheFeature()
         } withDependencies: {
             $0.appDatabase = database
-            $0.continuousClock = clock
         }
 
         await store.send(.load) {
@@ -1308,9 +2122,181 @@ final class ArchiveReaderFeatureTests: XCTestCase {
                 )
             ]
         }
-        await store.receive(.refreshProgress)
-        await clock.advance(by: .seconds(2))
         await store.finish()
+    }
+
+    @MainActor
+    func testCacheFeatureLoadCountsDistinctValidPagesAndCanCancelPolling() async throws {
+        let id = "cacheProgressPolling"
+        let cacheFolder = LANraragiService.cachePath!.appendingPathComponent(id, conformingTo: .folder)
+        try? FileManager.default.removeItem(at: cacheFolder)
+        try FileManager.default.createDirectory(at: cacheFolder, withIntermediateDirectories: true)
+        for filename in ["0.jpg", "1.jpg", "1.png", "4.jpg", "notes.txt"] {
+            _ = FileManager.default.createFile(
+                atPath: cacheFolder.appendingPathComponent(filename).path,
+                contents: Data()
+            )
+        }
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: cacheFolder)
+        }
+
+        let database = try makeInMemoryDatabase()
+        var cache = ArchiveCache(
+            id: id,
+            title: "Archive",
+            tags: "",
+            thumbnail: nil,
+            cached: false,
+            totalPages: 3,
+            toc: nil,
+            lastUpdate: Date(timeIntervalSince1970: 1)
+        )
+        try database.saveCache(&cache)
+        let store = TestStore(initialState: CacheFeature.State()) {
+            CacheFeature()
+        } withDependencies: {
+            $0.appDatabase = database
+            $0.continuousClock = TestClock()
+        }
+
+        let task = await store.send(.load) {
+            $0.archives = [
+                GridFeature.State(
+                    archive: Shared(value: cache.toArchiveItem()),
+                    cached: true
+                )
+            ]
+            $0.downloading[id] = PageProgress(current: 0, total: 3)
+        }
+        await store.receive(.updateProgressInDownloading(id, 1)) {
+            $0.downloading[id]?.current = 1
+        }
+        await task.cancel()
+
+        XCTAssertEqual(try database.readCache(id)?.cached, false)
+    }
+
+    @MainActor
+    func testCacheFeatureLoadMarksCompleteDownloadWithoutAnotherPollingDelay() async throws {
+        let id = "cacheProgressComplete"
+        let cacheFolder = LANraragiService.cachePath!.appendingPathComponent(id, conformingTo: .folder)
+        try? FileManager.default.removeItem(at: cacheFolder)
+        try FileManager.default.createDirectory(at: cacheFolder, withIntermediateDirectories: true)
+        for page in 1...2 {
+            _ = FileManager.default.createFile(
+                atPath: cacheFolder.appendingPathComponent("\(page).jpg").path,
+                contents: Data()
+            )
+        }
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: cacheFolder)
+        }
+
+        let database = try makeInMemoryDatabase()
+        var cache = ArchiveCache(
+            id: id,
+            title: "Archive",
+            tags: "",
+            thumbnail: nil,
+            cached: false,
+            totalPages: 2,
+            toc: nil,
+            lastUpdate: Date(timeIntervalSince1970: 1)
+        )
+        try database.saveCache(&cache)
+        let store = TestStore(initialState: CacheFeature.State()) {
+            CacheFeature()
+        } withDependencies: {
+            $0.appDatabase = database
+            $0.continuousClock = TestClock()
+        }
+
+        let task = await store.send(.load) {
+            $0.archives = [
+                GridFeature.State(
+                    archive: Shared(value: cache.toArchiveItem()),
+                    cached: true
+                )
+            ]
+            $0.downloading[id] = PageProgress(current: 0, total: 2)
+        }
+        await store.receive(.removeItemFromDownloading(id)) {
+            $0.downloading.removeValue(forKey: id)
+        }
+        await task.finish()
+
+        XCTAssertEqual(try database.readCache(id)?.cached, true)
+    }
+
+    @MainActor
+    func testPageAspectRatiosPrimedAssignsRatiosAndMedianEstimate() async {
+        configureReaderDefaults(readDirection: .upDown)
+        var initialState = makeState(readDirection: .upDown)
+        initialState.pages = makePageStates(count: 3)
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.pageAspectRatiosPrimed([1: 1.2, 2: 1.5, 3: 1.8])) {
+            $0.pages[0].imageAspectRatio = 1.2
+            $0.pages[1].imageAspectRatio = 1.5
+            $0.pages[2].imageAspectRatio = 1.8
+            $0.estimatedPageAspectRatio = 1.5
+        }
+    }
+
+    @MainActor
+    func testPageAspectRatiosPrimedLeavesAlreadyMeasuredPagesUntouched() async {
+        configureReaderDefaults(readDirection: .upDown)
+        var initialState = makeState(readDirection: .upDown)
+        initialState.pages = makePageStates(count: 2)
+        initialState.pages[0].imageAspectRatio = 2.0
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.pageAspectRatiosPrimed([1: 1.2, 2: 1.4])) {
+            $0.pages[1].imageAspectRatio = 1.4
+            $0.estimatedPageAspectRatio = 2.0
+        }
+    }
+
+    @MainActor
+    func testPrimePageAspectRatiosWithoutPagesDoesNothing() async {
+        configureReaderDefaults(readDirection: .upDown)
+        let store = makeTestStore(initialState: makeState(readDirection: .upDown))
+
+        await store.send(.primePageAspectRatios)
+    }
+
+    @MainActor
+    func testSplitPageResolutionCopiesAspectRatioToInsertedSibling() async {
+        configureReaderDefaults(splitWideImage: true)
+        var initialState = makeState(progress: 1)
+        initialState.$splitImage = SharedReader(value: true)
+        initialState.pages = makePageStates(count: 2)
+        initialState.pages[0].imageAspectRatio = 0.7
+        initialState.currentPageIndex = 0
+        let splittingPageId = initialState.pages[0].id
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.page(.element(
+            id: splittingPageId,
+            action: .storedImageResolved(shouldDisplayAsSplitPages: true)
+        ))) {
+            $0.pages[0].pageMode = .right
+            $0.pages[0].imageLoaded = true
+            var sibling = loadedPageState(
+                archiveId: "archive",
+                pageId: "1",
+                pageNumber: 1,
+                pageMode: .left
+            )
+            sibling.imageAspectRatio = 0.7
+            $0.pages.insert(sibling, at: 1)
+            $0.estimatedPageAspectRatio = 0.7
+        }
+
+        // A split page shows half the source width, so it renders twice as tall relative to its width.
+        XCTAssertEqual(store.state.pages[0].displayAspectRatio, 1.4)
+        XCTAssertEqual(store.state.pages[1].displayAspectRatio, 1.4)
     }
 
     @MainActor
@@ -1626,6 +2612,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
         controller.loadViewIfNeeded()
         await Task.yield()
         await Task.yield()
+        await waitForScrollRequestToFinish(store)
 
         XCTAssertNil(store.scrollRequest)
     }
@@ -1650,6 +2637,75 @@ final class ArchiveReaderFeatureTests: XCTestCase {
 
         XCTAssertEqual(store.currentPageIndex, 2)
         XCTAssertEqual(store.allArchives[id: "archive"]?.wrappedValue.progress, 3)
+    }
+
+    @MainActor
+    func testUIPageCollectionShiftsSpreadItemsWhenToggledFromSecondPage() async {
+        configureReaderDefaults()
+        var initialState = makeState(progress: 2)
+        initialState.pages = makePageStates(count: 5)
+        initialState.currentPageIndex = 1
+        let expectedItems = [ReaderCollectionItem.spreadPlaceholder]
+            + initialState.pages.map { ReaderCollectionItem.page($0.id) }
+
+        let store = Store(initialState: initialState) {
+            ArchiveReaderFeature()
+        } withDependencies: {
+            $0.continuousClock = ImmediateClock()
+            $0.uuid = .incrementing
+        }
+        let controller = UIPageCollectionController(store: store)
+
+        controller.loadViewIfNeeded()
+        await Task.yield()
+        await store.send(.toggleDoublePageLayout).finish()
+        await Task.yield()
+        await Task.yield()
+        await waitForScrollRequestToFinish(store)
+
+        XCTAssertEqual(store.spreadPairingOffset, 1)
+        let collectionItems = controller.dataSource.snapshot().itemIdentifiers
+        XCTAssertEqual(collectionItems, expectedItems)
+        XCTAssertEqual(collectionItems[2], .page(initialState.pages[1].id))
+        XCTAssertEqual(collectionItems[3], .page(initialState.pages[2].id))
+        XCTAssertNil(store.scrollRequest)
+    }
+
+    @MainActor
+    func testUIPageCollectionRepeatedDoublePageTogglesStayAlignedToSpreadBoundary() async {
+        configureReaderDefaults()
+        var initialState = makeState(progress: 2)
+        initialState.pages = makePageStates(count: 5)
+        initialState.currentPageIndex = 1
+
+        let store = Store(initialState: initialState) {
+            ArchiveReaderFeature()
+        } withDependencies: {
+            $0.continuousClock = ImmediateClock()
+            $0.uuid = .incrementing
+        }
+        let controller = UIPageCollectionController(store: store)
+
+        controller.loadViewIfNeeded()
+        controller.view.frame = CGRect(x: 0, y: 0, width: 320, height: 480)
+        controller.view.layoutIfNeeded()
+        await Task.yield()
+        await Task.yield()
+
+        store.send(.toggleDoublePageLayout)
+        store.send(.toggleDoublePageLayout)
+        store.send(.toggleDoublePageLayout)
+        await Task.yield()
+        await Task.yield()
+        await Task.yield()
+        await waitForScrollRequestToFinish(store)
+        controller.collectionView.layoutIfNeeded()
+
+        let viewportWidth = controller.collectionView.bounds.width
+        let remainder = controller.collectionView.contentOffset.x
+            .truncatingRemainder(dividingBy: viewportWidth)
+        XCTAssertEqual(remainder, 0, accuracy: 1)
+        XCTAssertNil(store.scrollRequest)
     }
 
     @MainActor
@@ -2186,6 +3242,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
         )
         state.pages = makePageStates(count: 3, archiveId: "one")
         state.currentPageIndex = 2
+        state.spreadPairingOffset = 1
         state.fromStart = true
         state.scrollRequest = ScrollRequest(targetPageIndex: 2, source: .slider, animated: false)
         state.inCache = true
@@ -2204,6 +3261,7 @@ final class ArchiveReaderFeatureTests: XCTestCase {
 
         XCTAssertTrue(state.pages.isEmpty)
         XCTAssertEqual(state.currentPageIndex, 0)
+        XCTAssertEqual(state.spreadPairingOffset, 0)
         XCTAssertFalse(state.fromStart)
         XCTAssertNil(state.scrollRequest)
         XCTAssertFalse(state.inCache)
@@ -2241,20 +3299,66 @@ final class ArchiveReaderFeatureTests: XCTestCase {
     }
 
     @MainActor
-    func testToggleDoublePageLayoutDisablesLayoutAndKeepsCurrentPage() async {
-        configureReaderDefaults(doublePageLayout: true)
-        var initialState = makeState(progress: 4, doublePageLayout: true)
+    func testToggleDoublePageLayoutMakesCurrentLTRPageStartOfShiftedSpread() async {
+        configureReaderDefaults(readDirection: .leftRight)
+        var initialState = makeState(progress: 2, readDirection: .leftRight)
         initialState.pages = makePageStates(count: 5)
-        initialState.currentPageIndex = 3
+        initialState.currentPageIndex = 1
         let store = makeTestStore(initialState: initialState)
 
         await store.send(.toggleDoublePageLayout) {
-            $0.$doublePageLayout.withLock { $0 = false }
+            $0.spreadPairingOffset = 1
+            $0.$doublePageLayout.withLock { $0 = true }
         }
-        await store.receive(.requestJump(3, source: .layoutChange)) {
+        await store.receive(.requestJump(2, source: .layoutChange)) {
             $0.scrollRequest = makeScrollRequest(
                 id: 0,
-                targetPageIndex: 3,
+                targetPageIndex: 2,
+                source: .layoutChange,
+                animated: false
+            )
+        }
+    }
+
+    @MainActor
+    func testToggleDoublePageLayoutMakesCurrentRTLPageStartOfShiftedSpread() async {
+        configureReaderDefaults(readDirection: .rightLeft)
+        var initialState = makeState(progress: 2, readDirection: .rightLeft)
+        initialState.pages = makePageStates(count: 5)
+        initialState.currentPageIndex = 1
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.toggleDoublePageLayout) {
+            $0.spreadPairingOffset = 1
+            $0.$doublePageLayout.withLock { $0 = true }
+        }
+        await store.receive(.requestJump(2, source: .layoutChange)) {
+            $0.scrollRequest = makeScrollRequest(
+                id: 0,
+                targetPageIndex: 2,
+                source: .layoutChange,
+                animated: false
+            )
+        }
+    }
+
+    @MainActor
+    func testToggleDoublePageLayoutDisablesLayoutAndKeepsCurrentPage() async {
+        configureReaderDefaults(doublePageLayout: true)
+        var initialState = makeState(progress: 3, doublePageLayout: true)
+        initialState.pages = makePageStates(count: 5)
+        initialState.currentPageIndex = 2
+        initialState.spreadPairingOffset = 1
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.toggleDoublePageLayout) {
+            $0.spreadPairingOffset = 0
+            $0.$doublePageLayout.withLock { $0 = false }
+        }
+        await store.receive(.requestJump(2, source: .layoutChange)) {
+            $0.scrollRequest = makeScrollRequest(
+                id: 0,
+                targetPageIndex: 2,
                 source: .layoutChange,
                 animated: false
             )
@@ -2276,6 +3380,77 @@ final class ArchiveReaderFeatureTests: XCTestCase {
         let splitStore = makeTestStore(initialState: splitState)
         await splitStore.send(.toggleDoublePageLayout)
     }
+}
+
+@MainActor
+private func waitForScrollRequestToFinish(_ store: StoreOf<ArchiveReaderFeature>) async {
+    for _ in 0..<100 where store.scrollRequest != nil {
+        try? await Task<Never, Never>.sleep(for: .milliseconds(10))
+    }
+}
+
+@MainActor
+private func waitForStampsToLoad(
+    _ store: StoreOf<ArchiveReaderFeature>,
+    pageId: String
+) async {
+    for _ in 0..<100 where store.pages[id: pageId]?.stampsLoaded != true {
+        try? await Task<Never, Never>.sleep(for: .milliseconds(10))
+    }
+}
+
+@MainActor
+private func waitForStampMarker(in view: UIView, comment: String) async -> UIButton? {
+    for _ in 0..<100 {
+        view.layoutIfNeeded()
+        if let marker = stampMarker(in: view, comment: comment) {
+            return marker
+        }
+        try? await Task<Never, Never>.sleep(for: .milliseconds(10))
+    }
+    return nil
+}
+
+@MainActor
+private func stampMarker(in view: UIView, comment: String) -> UIButton? {
+    firstDescendant(in: view) { button in
+        button.accessibilityLabel == comment
+    }
+}
+
+@MainActor
+private func stampComment(in view: UIView, text: String) -> UILabel? {
+    firstDescendant(in: view) { label in
+        label.text == text
+    }
+}
+
+@MainActor
+private func firstDescendant<View: UIView>(
+    in root: UIView,
+    matching predicate: (View) -> Bool
+) -> View? {
+    for subview in root.subviews {
+        if let candidate = subview as? View, predicate(candidate) {
+            return candidate
+        }
+        if let candidate: View = firstDescendant(in: subview, matching: predicate) {
+            return candidate
+        }
+    }
+    return nil
+}
+
+@MainActor
+private func isEffectivelyHidden(_ view: UIView) -> Bool {
+    var currentView: UIView? = view
+    while let current = currentView {
+        if current.isHidden || current.alpha == 0 {
+            return true
+        }
+        currentView = current.superview
+    }
+    return false
 }
 
 private func configureReaderDefaults(
@@ -2816,6 +3991,115 @@ private func loadedPageState(
     )
     state.imageLoaded = true
     return state
+}
+
+private func stubArchiveStamps(
+    archiveId: String,
+    page: Int,
+    stamps: [ArchiveStamp] = [
+        ArchiveStamp(id: "stamp", position: "12,34", content: "Comment")
+    ]
+) {
+    let response = [
+        "result": stamps.map { stamp in
+            [
+                "id": stamp.id as Any,
+                "position": stamp.position,
+                "content": stamp.content
+            ]
+        }
+    ]
+    let responseData = (try? JSONSerialization.data(withJSONObject: response)) ?? Data()
+
+    stub(condition: isHost("localhost")
+            && isPath("/api/archives/\(archiveId)/stamps/\(page)")
+            && isMethodGET()
+            && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")) { _ in
+        HTTPStubsResponse(
+            data: responseData,
+            statusCode: 200,
+            headers: ["Content-Type": "application/json"]
+        )
+    }
+}
+
+private func stubArchiveStampsFailure(archiveId: String, page: Int, statusCode: Int32) {
+    stub(condition: isHost("localhost")
+            && isPath("/api/archives/\(archiveId)/stamps/\(page)")
+            && isMethodGET()
+            && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")) { _ in
+        HTTPStubsResponse(
+            data: Data("{\"error\":\"stamps unavailable\"}".utf8),
+            statusCode: statusCode,
+            headers: ["Content-Type": "application/json"]
+        )
+    }
+}
+
+private func stubAddArchiveStamp(
+    archiveId: String,
+    page: Int,
+    content: String,
+    position: String,
+    success: Int = 1
+) {
+    stub(condition: isHost("localhost")
+            && isPath("/api/archives/\(archiveId)/stamps/\(page)")
+            && containsQueryParams([
+                "content": content,
+                "position": position
+            ])
+            && isMethodPUT()
+            && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")) { _ in
+        HTTPStubsResponse(
+            data: Data("""
+            {
+              "operation": "add_stamp",
+              "stamp_id": "created-stamp",
+              "success": \(success)
+            }
+            """.utf8),
+            statusCode: 200,
+            headers: ["Content-Type": "application/json"]
+        )
+    }
+}
+
+private func stubUpdateArchiveStamp(stampId: String, content: String, success: Int = 1) {
+    stub(condition: isHost("localhost")
+            && isPath("/api/stamps/\(stampId)")
+            && containsQueryParams(["content": content])
+            && isMethodPUT()
+            && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")) { _ in
+        HTTPStubsResponse(
+            data: Data("""
+            {
+              "operation": "update_stamp",
+              "success": \(success)
+            }
+            """.utf8),
+            statusCode: 200,
+            headers: ["Content-Type": "application/json"]
+        )
+    }
+}
+
+private func stubDeleteArchiveStamp(stampId: String, success: Int = 1) {
+    stub(condition: isHost("localhost")
+            && isPath("/api/stamps/\(stampId)")
+            && isMethodDELETE()
+            && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")) { _ in
+        HTTPStubsResponse(
+            data: Data("""
+            {
+              "operation": "delete_stamp",
+              "success": \(success)
+            }
+            """.utf8),
+            statusCode: 200,
+            headers: ["Content-Type": "application/json"]
+        )
+    }
 }
 
 private func makePageStates(
