@@ -19,6 +19,98 @@ public struct ReaderExtractedPage: Equatable, Sendable {
     }
 }
 
+private let archiveExtractionLogger = Logger(label: "ArchiveExtraction")
+
+extension LANraragiService {
+    func extractArchiveForReading(
+        id: String
+    ) async throws -> (pages: [ReaderExtractedPage], tankoubonDetails: TankoubonDetailsMetadata?) {
+        guard id.isTankoubonArchiveId else {
+            let response = try await extractArchive(id: id).value
+            return (
+                pages: Self.extractedPages(from: response.pages, archiveId: id),
+                tankoubonDetails: nil
+            )
+        }
+
+        let tankoubon = try await retrieveFullTankoubon(id: id).value
+        var details = TankoubonDetailsMetadata(response: tankoubon)
+        let archiveIds = Self.tankoubonArchiveIds(from: tankoubon)
+        let archiveMetadata = Dictionary(
+            (tankoubon.result.fullData ?? []).map { ($0.arcid, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var pages: [ReaderExtractedPage] = []
+        var chapters: [ArchiveChapter] = []
+
+        if archiveIds.isEmpty {
+            archiveExtractionLogger.error("tankoubon returned no archives. id=\(id)")
+        }
+
+        for archiveId in archiveIds {
+            let metadata = archiveMetadata[archiveId]
+            let response = try await extractArchive(id: archiveId).value
+            if response.pages.isEmpty {
+                archiveExtractionLogger.error("server returned empty pages. id=\(archiveId)")
+            }
+            let extractedPages = Self.extractedPages(from: response.pages, archiveId: archiveId)
+            let chapterResult = Self.tankoubonChapters(
+                from: metadata,
+                pageOffset: pages.count,
+                extractedPageCount: extractedPages.count
+            )
+            chapters.append(contentsOf: chapterResult.chapters)
+            if let metadata, !metadata.title.isEmpty, !extractedPages.isEmpty {
+                details.defaultChapters.append(
+                    ArchiveChapter(name: metadata.title, page: pages.count + 1)
+                )
+            }
+            if let automaticPage = chapterResult.automaticPage {
+                details.automaticChapterPages.insert(automaticPage)
+            }
+            pages.append(contentsOf: extractedPages)
+        }
+
+        details.toc = chapters.isEmpty ? nil : chapters
+        return (pages: pages, tankoubonDetails: details)
+    }
+
+    private static func tankoubonArchiveIds(from response: TankoubonFullResponse) -> [String] {
+        if let archives = response.result.archives, !archives.isEmpty {
+            return archives
+        }
+        return response.result.fullData?.map(\.arcid) ?? []
+    }
+
+    private static func extractedPages(from pages: [String], archiveId: String) -> [ReaderExtractedPage] {
+        pages.enumerated().map { index, path in
+            ReaderExtractedPage(archiveId: archiveId, path: path, archivePageNumber: index + 1)
+        }
+    }
+
+    private static func tankoubonChapters(
+        from archiveMetadata: ArchiveIndexResponse?,
+        pageOffset: Int,
+        extractedPageCount: Int
+    ) -> (chapters: [ArchiveChapter], automaticPage: Int?) {
+        guard extractedPageCount > 0, let archiveMetadata else { return ([], nil) }
+        var chapters: [ArchiveChapter] = (archiveMetadata.toc ?? []).compactMap { chapter in
+            guard (1...extractedPageCount).contains(chapter.page) else { return nil }
+            return ArchiveChapter(name: chapter.name, page: pageOffset + chapter.page)
+        }
+        let firstPage = pageOffset + 1
+        if !archiveMetadata.title.isEmpty,
+           !chapters.contains(where: { $0.page == firstPage }) {
+            chapters.insert(
+                ArchiveChapter(name: archiveMetadata.title, page: firstPage),
+                at: 0
+            )
+            return (chapters, firstPage)
+        }
+        return (chapters, nil)
+    }
+}
+
 public struct SliderPreviewThumbnailQueueResult: Equatable, Sendable {
     public let archiveId: String
     public let response: PageThumbnailQueueResponse
@@ -37,6 +129,13 @@ public struct StampCreationTarget: Equatable, Sendable {
 
 public struct StampEditingTarget: Equatable, Sendable {
     let stampId: String
+    let sourceArchiveId: String
+    let sourcePageNumber: Int
+}
+
+public struct ChapterMutationTarget: Equatable, Sendable {
+    let readerArchiveId: String
+    let readerPageNumber: Int
     let sourceArchiveId: String
     let sourcePageNumber: Int
 }
@@ -98,6 +197,11 @@ public struct StampEditingTarget: Equatable, Sendable {
         var stampEditText = ""
         var stampRequestInFlight = false
         var stampsSupported: Bool?
+        var chapterCreationTarget: ChapterMutationTarget?
+        var chapterEditingTarget: ChapterMutationTarget?
+        var chapterTitle = ""
+        var chapterRequestInFlight = false
+        var chapterMutationsSupported: Bool?
 
         var allArchives: IdentifiedArrayOf<Shared<ArchiveItem>> = []
 
@@ -141,6 +245,22 @@ public struct StampEditingTarget: Equatable, Sendable {
             return currentArchive.wrappedValue.toc ?? []
         }
 
+        var canAddChapter: Bool {
+            !cached && chapterMutationsSupported != false && currentPage != nil
+        }
+
+        var editableChapterPages: Set<Int> {
+            guard !cached, chapterMutationsSupported != false else { return [] }
+            let chapterPages = Set(chapters.map(\.page))
+            guard currentArchiveId.isTankoubonArchiveId else { return chapterPages }
+            guard let currentTankoubonDetails else { return [] }
+            return chapterPages.subtracting(currentTankoubonDetails.automaticChapterPages)
+        }
+
+        var shouldShowChapterMenu: Bool {
+            !chapters.isEmpty || canAddChapter
+        }
+
         var canOpenDetails: Bool {
             guard !extracting else { return false }
             guard currentArchiveId.isTankoubonArchiveId else { return true }
@@ -174,6 +294,7 @@ public struct StampEditingTarget: Equatable, Sendable {
         case page(IdentifiedActionOf<PageFeature>)
         case extractArchive
         case stampsSupportResolved(Bool?)
+        case chapterMutationSupportResolved(Bool?)
         case finishExtracting([ReaderExtractedPage], TankoubonDetailsMetadata?)
         case primePageAspectRatios
         case pageAspectRatiosPrimed([Int: Double])
@@ -200,6 +321,15 @@ public struct StampEditingTarget: Equatable, Sendable {
         case stampDeleted(target: StampEditingTarget)
         case stampDeleteFailed(target: StampEditingTarget, content: String)
         case visiblePageChanged(Int)
+        case chapterCreationRequested
+        case chapterEditingRequested(Int)
+        case cancelChapterMutation
+        case confirmChapterMutation
+        case confirmChapterDeletion
+        case chapterSaved(target: ChapterMutationTarget, title: String)
+        case chapterSaveFailed(target: ChapterMutationTarget, title: String, isEditing: Bool)
+        case chapterDeleted(target: ChapterMutationTarget)
+        case chapterDeleteFailed(target: ChapterMutationTarget, title: String)
         case chapterSelected(Int)
         case requestJump(Int, source: ReaderNavigationSource)
         case navigate(ReaderNavigationDirection, source: ReaderNavigationSource)
@@ -251,6 +381,7 @@ public struct StampEditingTarget: Equatable, Sendable {
         case primePageAspectRatios
         case stampCreation
         case stampMutation
+        case chapterCreation
     }
 
     public var body: some ReducerOf<Self> {
@@ -320,55 +451,16 @@ public struct StampEditingTarget: Equatable, Sendable {
                 return .run { send in
                     let stampsSupported = await service.stampSupportForCurrentServer()
                     await send(.stampsSupportResolved(stampsSupported))
-                    let pages: [ReaderExtractedPage]
-                    var tankoubonDetails: TankoubonDetailsMetadata?
-                    if id.isTankoubonArchiveId {
-                        let tankoubon = try await service.retrieveFullTankoubon(id: id).value
-                        var details = TankoubonDetailsMetadata(response: tankoubon)
-                        let archiveIds = Self.tankoubonArchiveIds(from: tankoubon)
-                        let archiveMetadata = Dictionary(
-                            (tankoubon.result.fullData ?? []).map { ($0.arcid, $0) },
-                            uniquingKeysWith: { first, _ in first }
-                        )
-                        var tankPages: [ReaderExtractedPage] = []
-                        var tankChapters: [ArchiveChapter] = []
+                    let chapterMutationsSupported = await service.chapterMutationSupportForCurrentServer()
+                    await send(.chapterMutationSupportResolved(chapterMutationsSupported))
+                    let extraction = try await service.extractArchiveForReading(id: id)
 
-                        if archiveIds.isEmpty {
-                            logger.error("tankoubon returned no archives. id=\(id)")
-                        }
-
-                        for archiveId in archiveIds {
-                            let extractResponse = try await service.extractArchive(id: archiveId).value
-                            if extractResponse.pages.isEmpty {
-                                logger.error("server returned empty pages. id=\(archiveId)")
-                            }
-                            let extractedPages = Self.extractedPages(
-                                from: extractResponse.pages,
-                                archiveId: archiveId
-                            )
-                            tankChapters.append(
-                                contentsOf: Self.tankoubonChapters(
-                                    from: archiveMetadata[archiveId],
-                                    pageOffset: tankPages.count,
-                                    extractedPageCount: extractedPages.count
-                                )
-                            )
-                            tankPages.append(contentsOf: extractedPages)
-                        }
-                        details.toc = tankChapters.isEmpty ? nil : tankChapters
-                        tankoubonDetails = details
-                        pages = tankPages
-                    } else {
-                        let extractResponse = try await service.extractArchive(id: id).value
-                        pages = Self.extractedPages(from: extractResponse.pages, archiveId: id)
-                    }
-
-                    if pages.isEmpty {
+                    if extraction.pages.isEmpty {
                         logger.error("server returned empty pages. id=\(id)")
                         let errorMessage = String(localized: "error.page.empty")
                         await send(.setError(errorMessage))
                     }
-                    await send(.finishExtracting(pages, tankoubonDetails))
+                    await send(.finishExtracting(extraction.pages, extraction.tankoubonDetails))
                 } catch: { error, send in
                     logger.error("failed to extract archive page. id=\(id) \(error)")
                     await send(.setError(error.localizedDescription))
@@ -387,6 +479,14 @@ public struct StampEditingTarget: Equatable, Sendable {
                     state.pages[id: pageId]?.stampsLoaded = true
                 }
                 return .none
+            case let .chapterMutationSupportResolved(isSupported):
+                state.chapterMutationsSupported = isSupported
+                guard isSupported == false else { return .none }
+                state.chapterCreationTarget = nil
+                state.chapterEditingTarget = nil
+                state.chapterTitle = ""
+                state.chapterRequestInFlight = false
+                return .cancel(id: CancelId.chapterCreation)
             case let .finishExtracting(pages, tankoubonDetails):
                 state.currentTankoubonDetails = tankoubonDetails
                 if !pages.isEmpty {
@@ -694,6 +794,143 @@ public struct StampEditingTarget: Equatable, Sendable {
                 state.stampEditingTarget = target
                 state.stampEditText = content
                 state.errorMessage = String(localized: "archive.reader.stamp.delete.failed")
+                return .none
+            case .chapterCreationRequested:
+                guard state.canAddChapter,
+                      !state.chapterRequestInFlight,
+                      state.chapterEditingTarget == nil,
+                      let page = state.currentPage else {
+                    return .none
+                }
+                state.chapterCreationTarget = ChapterMutationTarget(
+                    readerArchiveId: state.currentArchiveId,
+                    readerPageNumber: page.pageNumber,
+                    sourceArchiveId: page.sourceArchiveId,
+                    sourcePageNumber: page.sourcePageNumber
+                )
+                state.chapterTitle = ""
+                return .none
+            case let .chapterEditingRequested(pageNumber):
+                guard state.editableChapterPages.contains(pageNumber),
+                      !state.chapterRequestInFlight,
+                      state.chapterCreationTarget == nil,
+                      let chapter = state.chapters.first(where: { $0.page == pageNumber }),
+                      let page = state.pages.first(where: { $0.pageNumber == pageNumber }) else {
+                    return .none
+                }
+                state.chapterEditingTarget = ChapterMutationTarget(
+                    readerArchiveId: state.currentArchiveId,
+                    readerPageNumber: pageNumber,
+                    sourceArchiveId: page.sourceArchiveId,
+                    sourcePageNumber: page.sourcePageNumber
+                )
+                state.chapterTitle = chapter.name
+                return .none
+            case .cancelChapterMutation:
+                state.chapterCreationTarget = nil
+                state.chapterEditingTarget = nil
+                state.chapterTitle = ""
+                return .none
+            case .confirmChapterMutation:
+                let isEditing = state.chapterEditingTarget != nil
+                guard let target = state.chapterEditingTarget ?? state.chapterCreationTarget else { return .none }
+                let draft = state.chapterTitle
+                let title = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !title.isEmpty else { return .none }
+                state.chapterCreationTarget = nil
+                state.chapterEditingTarget = nil
+                state.chapterTitle = ""
+                state.chapterRequestInFlight = true
+                return .run { send in
+                    do {
+                        let response = try await service.addArchiveChapter(
+                            id: target.sourceArchiveId,
+                            page: target.sourcePageNumber,
+                            title: title
+                        ).value
+                        guard response.success == 1 else {
+                            await send(.chapterSaveFailed(target: target, title: draft, isEditing: isEditing))
+                            return
+                        }
+                        await send(.chapterSaved(target: target, title: title))
+                    } catch {
+                        let source = "\(target.sourceArchiveId):\(target.sourcePageNumber)"
+                        logger.warning("failed to save chapter. source=\(source) \(error.localizedDescription)")
+                        await send(.chapterSaveFailed(target: target, title: draft, isEditing: isEditing))
+                    }
+                }
+                .cancellable(id: CancelId.chapterCreation, cancelInFlight: true)
+            case .confirmChapterDeletion:
+                guard let target = state.chapterEditingTarget else { return .none }
+                let title = state.chapterTitle
+                state.chapterEditingTarget = nil
+                state.chapterTitle = ""
+                state.chapterRequestInFlight = true
+                return .run { send in
+                    do {
+                        let response = try await service.deleteArchiveChapter(
+                            id: target.sourceArchiveId,
+                            page: target.sourcePageNumber
+                        ).value
+                        guard response.success == 1 else {
+                            await send(.chapterDeleteFailed(target: target, title: title))
+                            return
+                        }
+                        await send(.chapterDeleted(target: target))
+                    } catch {
+                        let source = "\(target.sourceArchiveId):\(target.sourcePageNumber)"
+                        logger.warning("failed to delete chapter. source=\(source) \(error.localizedDescription)")
+                        await send(.chapterDeleteFailed(target: target, title: title))
+                    }
+                }
+                .cancellable(id: CancelId.chapterCreation, cancelInFlight: true)
+            case let .chapterSaved(target, title):
+                state.chapterRequestInFlight = false
+                guard let archive = state.allArchives[id: target.readerArchiveId] else { return .none }
+                var chapters = archive.wrappedValue.toc ?? []
+                chapters.removeAll { $0.page == target.readerPageNumber }
+                chapters.append(ArchiveChapter(name: title, page: target.readerPageNumber))
+                chapters.sort { $0.page < $1.page }
+                archive.withLock { $0.toc = chapters }
+                if state.currentTankoubonDetails?.id == target.readerArchiveId {
+                    state.currentTankoubonDetails?.toc = chapters
+                    state.currentTankoubonDetails?.automaticChapterPages.remove(target.readerPageNumber)
+                }
+                return .none
+            case let .chapterSaveFailed(target, title, isEditing):
+                state.chapterRequestInFlight = false
+                if isEditing {
+                    state.chapterEditingTarget = target
+                } else {
+                    state.chapterCreationTarget = target
+                }
+                state.chapterTitle = title
+                state.errorMessage = String(localized: isEditing
+                    ? "archive.reader.chapter.edit.failed"
+                    : "archive.reader.chapter.add.failed")
+                return .none
+            case let .chapterDeleted(target):
+                state.chapterRequestInFlight = false
+                guard let archive = state.allArchives[id: target.readerArchiveId] else { return .none }
+                var chapters = archive.wrappedValue.toc ?? []
+                chapters.removeAll { $0.page == target.readerPageNumber }
+                if state.currentTankoubonDetails?.id == target.readerArchiveId {
+                    if let defaultChapter = state.currentTankoubonDetails?.defaultChapters.first(
+                        where: { $0.page == target.readerPageNumber }
+                    ) {
+                        chapters.append(defaultChapter)
+                        chapters.sort { $0.page < $1.page }
+                        state.currentTankoubonDetails?.automaticChapterPages.insert(defaultChapter.page)
+                    }
+                    state.currentTankoubonDetails?.toc = chapters.isEmpty ? nil : chapters
+                }
+                archive.withLock { $0.toc = chapters.isEmpty ? nil : chapters }
+                return .none
+            case let .chapterDeleteFailed(target, title):
+                state.chapterRequestInFlight = false
+                state.chapterEditingTarget = target
+                state.chapterTitle = title
+                state.errorMessage = String(localized: "archive.reader.chapter.delete.failed")
                 return .none
             case let .visiblePageChanged(index):
                 guard !state.pages.isEmpty else { return .none }
@@ -1207,6 +1444,7 @@ public struct StampEditingTarget: Equatable, Sendable {
                     .cancel(id: CancelId.sliderPreviewLoad),
                     .cancel(id: CancelId.stampCreation),
                     .cancel(id: CancelId.stampMutation),
+                    .cancel(id: CancelId.chapterCreation),
                     state.cached ? .send(.loadCached) : .send(.extractArchive)
                 )
             case .loadNextArchive:
@@ -1223,6 +1461,7 @@ public struct StampEditingTarget: Equatable, Sendable {
                     .cancel(id: CancelId.sliderPreviewLoad),
                     .cancel(id: CancelId.stampCreation),
                     .cancel(id: CancelId.stampMutation),
+                    .cancel(id: CancelId.chapterCreation),
                     state.cached ? .send(.loadCached) : .send(.extractArchive)
                 )
             }
@@ -1232,40 +1471,6 @@ public struct StampEditingTarget: Equatable, Sendable {
         }
         .ifLet(\.$alert, action: \.alert)
     }
-    private static func tankoubonArchiveIds(from response: TankoubonFullResponse) -> [String] {
-        if let archives = response.result.archives, !archives.isEmpty {
-            return archives
-        }
-        return response.result.fullData?.map(\.arcid) ?? []
-    }
-
-    private static func extractedPages(from pages: [String], archiveId: String) -> [ReaderExtractedPage] {
-        pages.enumerated().map { index, path in
-            ReaderExtractedPage(archiveId: archiveId, path: path, archivePageNumber: index + 1)
-        }
-    }
-
-    private static func tankoubonChapters(
-        from archiveMetadata: ArchiveIndexResponse?,
-        pageOffset: Int,
-        extractedPageCount: Int
-    ) -> [ArchiveChapter] {
-        guard extractedPageCount > 0, let archiveMetadata else { return [] }
-        var chapters: [ArchiveChapter] = (archiveMetadata.toc ?? []).compactMap { chapter in
-            guard (1...extractedPageCount).contains(chapter.page) else { return nil }
-            return ArchiveChapter(name: chapter.name, page: pageOffset + chapter.page)
-        }
-        let firstPage = pageOffset + 1
-        if !archiveMetadata.title.isEmpty,
-           !chapters.contains(where: { $0.page == firstPage }) {
-            chapters.insert(
-                ArchiveChapter(name: archiveMetadata.title, page: firstPage),
-                at: 0
-            )
-        }
-        return chapters
-    }
-
     private static func readerPageNumbers(
         in pages: IdentifiedArrayOf<PageFeature.State>,
         sourceArchiveId: String,
@@ -1524,6 +1729,10 @@ public struct StampEditingTarget: Equatable, Sendable {
         state.stampEditingTarget = nil
         state.stampEditText = ""
         state.stampRequestInFlight = false
+        state.chapterCreationTarget = nil
+        state.chapterEditingTarget = nil
+        state.chapterTitle = ""
+        state.chapterRequestInFlight = false
         resetSliderPreviewArchiveState(state: &state)
     }
 }
@@ -1575,6 +1784,36 @@ struct ArchiveReader: View {
         .alert(
             $store.scope(\.$alert, action: \.alert)
         )
+        .alert(
+            store.chapterEditingTarget == nil
+                ? "archive.reader.chapter.add"
+                : "archive.reader.chapter.edit.title",
+            isPresented: Binding(
+                get: { store.chapterCreationTarget != nil || store.chapterEditingTarget != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        store.send(.cancelChapterMutation)
+                    }
+                }
+            )
+        ) {
+            TextField(
+                "archive.reader.chapter.title.placeholder",
+                text: $store.chapterTitle
+            )
+            if store.chapterEditingTarget != nil {
+                Button("delete", role: .destructive) {
+                    store.send(.confirmChapterDeletion)
+                }
+            }
+            Button("cancel", role: .cancel) {
+                store.send(.cancelChapterMutation)
+            }
+            Button("save") {
+                store.send(.confirmChapterMutation)
+            }
+            .disabled(store.chapterTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
         .alert(
             "archive.reader.stamp.add.title",
             isPresented: Binding(
@@ -1715,7 +1954,7 @@ struct ArchiveReader: View {
                         displayIndex: displayIndex,
                         sliderContext: sliderContext,
                         bubbleLayout: bubbleLayout,
-                        showsChapterMenu: !store.chapters.isEmpty
+                        showsChapterMenu: store.shouldShowChapterMenu
                     )
                 }
 
@@ -1959,13 +2198,13 @@ struct ArchiveReader: View {
         context: ReaderSliderContext
     ) -> some View {
         HStack(spacing: ReaderToolbarMetrics.chapterMenuSpacing) {
-            if !store.chapters.isEmpty {
+            if store.shouldShowChapterMenu {
                 readerChapterMenu(store: store)
             }
 
             readerSliderTrack(store: store, context: context)
         }
-        .frame(height: store.chapters.isEmpty ? 34 : ReaderToolbarMetrics.buttonSize)
+        .frame(height: store.shouldShowChapterMenu ? ReaderToolbarMetrics.buttonSize : 34)
     }
 
     private func readerSliderTrack(
@@ -2022,11 +2261,35 @@ struct ArchiveReader: View {
     private func readerChapterMenu(
         store: StoreOf<ArchiveReaderFeature>
     ) -> some View {
-        Menu {
+        let editablePages = store.editableChapterPages
+        return Menu {
             ForEach(store.chapters) { chapter in
                 Button(chapter.name) {
                     store.send(.chapterSelected(chapter.page))
                 }
+            }
+            if !store.chapters.isEmpty, !editablePages.isEmpty || store.canAddChapter {
+                Divider()
+            }
+            if !editablePages.isEmpty {
+                Menu {
+                    ForEach(store.chapters.filter { editablePages.contains($0.page) }) { chapter in
+                        Button(chapter.name) {
+                            store.send(.chapterEditingRequested(chapter.page))
+                        }
+                        .disabled(store.chapterRequestInFlight)
+                    }
+                } label: {
+                    Label("archive.reader.chapters.edit", systemImage: "pencil")
+                }
+            }
+            if store.canAddChapter {
+                Button {
+                    store.send(.chapterCreationRequested)
+                } label: {
+                    Label("archive.reader.chapter.add", systemImage: "plus")
+                }
+                .disabled(store.chapterRequestInFlight)
             }
         } label: {
             readerToolbarGlyph(systemImage: "list.bullet.rectangle", tint: Color.indigo)

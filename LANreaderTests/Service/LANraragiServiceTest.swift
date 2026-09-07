@@ -69,6 +69,16 @@ class LANraragiServiceTest: XCTestCase {
         XCTAssertEqual(supported, true)
     }
 
+    func testChapterMutationSupportStartsWithServerVersionZeroNineSeventy() async {
+        await service.updateServerCapabilities(serverVersion: "0.9.69")
+        let unsupported = await service.supportsChapterMutations
+        XCTAssertEqual(unsupported, false)
+
+        await service.updateServerCapabilities(serverVersion: "0.9.70")
+        let supported = await service.supportsChapterMutations
+        XCTAssertEqual(supported, true)
+    }
+
     func testRetrieveArchiveIndex() async throws {
         try await configureVerifiedClient()
 
@@ -199,6 +209,55 @@ class LANraragiServiceTest: XCTestCase {
                 success: 1
             )
         )
+    }
+
+    func testAddArchiveChapterUsesPutQueryContract() async throws {
+        try await configureVerifiedClient()
+
+        stub(condition: isHost("localhost")
+                && isPath("/api/archives/\(archiveId)/toc")
+                && containsQueryParams([
+                    "page": "3",
+                    "title": "Chapter & notes"
+                ])
+                && isMethodPUT()
+                && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")
+                && { $0.ohhttpStubs_httpBody == nil }) { _ in
+            HTTPStubsResponse(
+                data: Data("{\"operation\":\"update_toc\",\"success\":1}".utf8),
+                statusCode: 200,
+                headers: ["Content-Type": "application/json"]
+            )
+        }
+
+        let actual = try await service.addArchiveChapter(
+            id: archiveId,
+            page: 3,
+            title: "Chapter & notes"
+        ).value
+
+        XCTAssertEqual(actual.success, 1)
+    }
+
+    func testDeleteArchiveChapterUsesDeleteQueryContract() async throws {
+        try await configureVerifiedClient()
+
+        stub(condition: isHost("localhost")
+                && isPath("/api/archives/\(archiveId)/toc")
+                && containsQueryParams(["page": "3"])
+                && isMethodDELETE()
+                && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")
+                && { $0.ohhttpStubs_httpBody == nil }) { _ in
+            HTTPStubsResponse(
+                data: Data("{\"operation\":\"remove_toc\",\"success\":1}".utf8),
+                statusCode: 200,
+                headers: ["Content-Type": "application/json"]
+            )
+        }
+
+        let actual = try await service.deleteArchiveChapter(id: archiveId, page: 3).value
+
+        XCTAssertEqual(actual.success, 1)
     }
 
     func testUpdateStampUsesPutQueryContract() async throws {

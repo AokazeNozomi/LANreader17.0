@@ -36,6 +36,8 @@ public struct TankoubonDetailsMetadata: Equatable, Hashable, Sendable {
     public var tags: String
     public let includedArchiveTags: String
     var toc: [ArchiveChapter]?
+    var automaticChapterPages: Set<Int> = []
+    var defaultChapters: [ArchiveChapter] = []
 
     public init(id: String, name: String? = nil, tags: String = "", includedArchiveTags: String = "") {
         self.id = id

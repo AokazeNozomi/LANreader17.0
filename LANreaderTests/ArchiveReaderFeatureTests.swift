@@ -204,6 +204,32 @@ final class ArchiveReaderFeatureTests: XCTestCase {
     }
 
     @MainActor
+    func testUnsupportedServerKeepsChaptersReadOnly() async {
+        configureReaderDefaults()
+        let chapter = ArchiveChapter(name: "Opening", page: 1)
+        var state = makeState(allArchives: [makeArchive(toc: [chapter])])
+        state.pages = [PageFeature.State(archiveId: "archive", pageId: "1", pageNumber: 1)]
+        state.chapterMutationsSupported = false
+        let store = makeTestStore(initialState: state)
+
+        XCTAssertEqual(store.state.chapters, [chapter])
+        XCTAssertFalse(store.state.canAddChapter)
+        XCTAssertTrue(store.state.editableChapterPages.isEmpty)
+
+        await store.send(.chapterCreationRequested)
+        await store.send(.chapterEditingRequested(chapter.page))
+        await store.send(.chapterSelected(chapter.page))
+        await store.receive(.requestJump(0, source: .chapter)) {
+            $0.scrollRequest = makeScrollRequest(
+                id: 0,
+                targetPageIndex: 0,
+                source: .chapter,
+                animated: false
+            )
+        }
+    }
+
+    @MainActor
     func testCachedPageDoesNotLoadStampsFromServer() async {
         let store = TestStore(
             initialState: PageFeature.State(
@@ -357,6 +383,336 @@ final class ArchiveReaderFeatureTests: XCTestCase {
             $0.pages[id: siblingPage.id]?.stamps = [stamp]
             $0.pages[id: siblingPage.id]?.stampsLoaded = true
             $0.$showStamps.withLock { $0 = true }
+        }
+    }
+
+    @MainActor
+    func testAddChapterUsesCurrentSourcePageAndUpdatesTankoubonChapters() async throws {
+        configureReaderDefaults()
+        try await configureVerifiedClient()
+
+        let tankId = "TANK_test"
+        let existingChapter = ArchiveChapter(name: "Earlier", page: 2)
+        stubAddArchiveChapter(archiveId: "source", page: 4, title: "New chapter")
+        var initialState = makeState(
+            archiveId: tankId,
+            allArchives: [makeArchive(id: tankId, toc: [existingChapter])]
+        )
+        initialState.pages = [
+            PageFeature.State(
+                archiveId: tankId,
+                pageId: "page",
+                pageNumber: 8,
+                sourceArchiveId: "source",
+                sourcePageNumber: 4
+            )
+        ]
+        initialState.currentTankoubonDetails = makeTankoubonDetailsMetadata(tankId: tankId, toc: [existingChapter])
+        let target = ChapterMutationTarget(
+            readerArchiveId: tankId,
+            readerPageNumber: 8,
+            sourceArchiveId: "source",
+            sourcePageNumber: 4
+        )
+        let chapters = [
+            existingChapter,
+            ArchiveChapter(name: "New chapter", page: 8)
+        ]
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.chapterCreationRequested) {
+            $0.chapterCreationTarget = target
+        }
+        await store.send(.binding(.set(\.chapterTitle, "  New chapter\n"))) {
+            $0.chapterTitle = "  New chapter\n"
+        }
+        await store.send(.confirmChapterMutation) {
+            $0.chapterCreationTarget = nil
+            $0.chapterTitle = ""
+            $0.chapterRequestInFlight = true
+        }
+        await store.receive(.chapterSaved(target: target, title: "New chapter")) {
+            $0.chapterRequestInFlight = false
+            $0.allArchives[id: tankId]?.withLock { $0.toc = chapters }
+            $0.currentTankoubonDetails?.toc = chapters
+        }
+    }
+
+    @MainActor
+    func testEditChapterUsesOriginalSourcePageAndUpdatesTitle() async throws {
+        configureReaderDefaults()
+        try await configureVerifiedClient()
+
+        let tankId = "TANK_test"
+        let chapter = ArchiveChapter(name: "Original", page: 8)
+        let updatedChapter = ArchiveChapter(name: "Updated", page: 8)
+        stubAddArchiveChapter(archiveId: "source", page: 4, title: "Updated")
+        var initialState = makeState(
+            archiveId: tankId,
+            allArchives: [makeArchive(id: tankId, toc: [chapter])]
+        )
+        initialState.pages = [
+            PageFeature.State(
+                archiveId: tankId,
+                pageId: "page",
+                pageNumber: 8,
+                sourceArchiveId: "source",
+                sourcePageNumber: 4
+            )
+        ]
+        initialState.currentTankoubonDetails = makeTankoubonDetailsMetadata(tankId: tankId, toc: [chapter])
+        let target = ChapterMutationTarget(
+            readerArchiveId: tankId,
+            readerPageNumber: 8,
+            sourceArchiveId: "source",
+            sourcePageNumber: 4
+        )
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.chapterEditingRequested(chapter.page)) {
+            $0.chapterEditingTarget = target
+            $0.chapterTitle = "Original"
+        }
+        await store.send(.binding(.set(\.chapterTitle, "  Updated\n"))) {
+            $0.chapterTitle = "  Updated\n"
+        }
+        await store.send(.confirmChapterMutation) {
+            $0.chapterEditingTarget = nil
+            $0.chapterTitle = ""
+            $0.chapterRequestInFlight = true
+        }
+        await store.receive(.chapterSaved(target: target, title: "Updated")) {
+            $0.chapterRequestInFlight = false
+            $0.allArchives[id: tankId]?.withLock { $0.toc = [updatedChapter] }
+            $0.currentTankoubonDetails?.toc = [updatedChapter]
+        }
+    }
+
+    @MainActor
+    func testEditChapterFailureRestoresDraft() async throws {
+        configureReaderDefaults()
+        try await configureVerifiedClient()
+
+        let chapter = ArchiveChapter(name: "Original", page: 4)
+        stubAddArchiveChapter(archiveId: "archive", page: 4, title: "Updated", success: 0)
+        var initialState = makeState(allArchives: [makeArchive(toc: [chapter])])
+        initialState.pages = [
+            PageFeature.State(archiveId: "archive", pageId: "4", pageNumber: 4)
+        ]
+        let target = ChapterMutationTarget(
+            readerArchiveId: "archive",
+            readerPageNumber: 4,
+            sourceArchiveId: "archive",
+            sourcePageNumber: 4
+        )
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.chapterEditingRequested(chapter.page)) {
+            $0.chapterEditingTarget = target
+            $0.chapterTitle = "Original"
+        }
+        await store.send(.binding(.set(\.chapterTitle, "  Updated\n"))) {
+            $0.chapterTitle = "  Updated\n"
+        }
+        await store.send(.confirmChapterMutation) {
+            $0.chapterEditingTarget = nil
+            $0.chapterTitle = ""
+            $0.chapterRequestInFlight = true
+        }
+        await store.receive(.chapterSaveFailed(
+            target: target,
+            title: "  Updated\n",
+            isEditing: true
+        )) {
+            $0.chapterRequestInFlight = false
+            $0.chapterEditingTarget = target
+            $0.chapterTitle = "  Updated\n"
+            $0.errorMessage = String(localized: "archive.reader.chapter.edit.failed")
+        }
+        XCTAssertEqual(store.state.chapters, [chapter])
+    }
+
+    @MainActor
+    func testDeleteChapterUsesOriginalSourcePageAndRemovesChapter() async throws {
+        configureReaderDefaults()
+        try await configureVerifiedClient()
+
+        let tankId = "TANK_test"
+        let chapter = ArchiveChapter(name: "Delete me", page: 8)
+        stubDeleteArchiveChapter(archiveId: "source", page: 4)
+        var initialState = makeState(
+            archiveId: tankId,
+            allArchives: [makeArchive(id: tankId, toc: [chapter])]
+        )
+        initialState.pages = [
+            PageFeature.State(
+                archiveId: tankId,
+                pageId: "page",
+                pageNumber: 8,
+                sourceArchiveId: "source",
+                sourcePageNumber: 4
+            )
+        ]
+        initialState.currentTankoubonDetails = makeTankoubonDetailsMetadata(tankId: tankId, toc: [chapter])
+        let target = ChapterMutationTarget(
+            readerArchiveId: tankId,
+            readerPageNumber: 8,
+            sourceArchiveId: "source",
+            sourcePageNumber: 4
+        )
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.chapterEditingRequested(chapter.page)) {
+            $0.chapterEditingTarget = target
+            $0.chapterTitle = chapter.name
+        }
+        await store.send(.confirmChapterDeletion) {
+            $0.chapterEditingTarget = nil
+            $0.chapterTitle = ""
+            $0.chapterRequestInFlight = true
+        }
+        await store.receive(.chapterDeleted(target: target)) {
+            $0.chapterRequestInFlight = false
+            $0.allArchives[id: tankId]?.withLock { $0.toc = nil }
+            $0.currentTankoubonDetails?.toc = nil
+        }
+    }
+
+    @MainActor
+    func testDeleteFirstPageTankoubonChapterRestoresAutomaticChapter() async throws {
+        configureReaderDefaults()
+        try await configureVerifiedClient()
+
+        let tankId = "TANK_test"
+        let manualChapter = ArchiveChapter(name: "Manual", page: 3)
+        let defaultChapter = ArchiveChapter(name: "Source", page: 3)
+        stubDeleteArchiveChapter(archiveId: "source", page: 1)
+        var initialState = makeState(
+            archiveId: tankId,
+            allArchives: [makeArchive(id: tankId, toc: [manualChapter])]
+        )
+        initialState.pages = [
+            PageFeature.State(
+                archiveId: tankId,
+                pageId: "page",
+                pageNumber: 3,
+                sourceArchiveId: "source",
+                sourcePageNumber: 1
+            )
+        ]
+        var details = makeTankoubonDetailsMetadata(tankId: tankId, toc: [manualChapter])
+        details.defaultChapters = [defaultChapter]
+        initialState.currentTankoubonDetails = details
+        let target = ChapterMutationTarget(
+            readerArchiveId: tankId,
+            readerPageNumber: 3,
+            sourceArchiveId: "source",
+            sourcePageNumber: 1
+        )
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.chapterEditingRequested(manualChapter.page)) {
+            $0.chapterEditingTarget = target
+            $0.chapterTitle = manualChapter.name
+        }
+        await store.send(.confirmChapterDeletion) {
+            $0.chapterEditingTarget = nil
+            $0.chapterTitle = ""
+            $0.chapterRequestInFlight = true
+        }
+        await store.receive(.chapterDeleted(target: target)) {
+            $0.chapterRequestInFlight = false
+            $0.allArchives[id: tankId]?.withLock { $0.toc = [defaultChapter] }
+            $0.currentTankoubonDetails?.toc = [defaultChapter]
+            $0.currentTankoubonDetails?.automaticChapterPages = [defaultChapter.page]
+        }
+        XCTAssertTrue(store.state.editableChapterPages.isEmpty)
+    }
+
+    @MainActor
+    func testDeleteChapterFailureRestoresEdit() async throws {
+        configureReaderDefaults()
+        try await configureVerifiedClient()
+
+        let chapter = ArchiveChapter(name: "Keep me", page: 4)
+        stubDeleteArchiveChapter(archiveId: "archive", page: 4, success: 0)
+        var initialState = makeState(allArchives: [makeArchive(toc: [chapter])])
+        initialState.pages = [
+            PageFeature.State(archiveId: "archive", pageId: "4", pageNumber: 4)
+        ]
+        let target = ChapterMutationTarget(
+            readerArchiveId: "archive",
+            readerPageNumber: 4,
+            sourceArchiveId: "archive",
+            sourcePageNumber: 4
+        )
+        let store = makeTestStore(initialState: initialState)
+
+        await store.send(.chapterEditingRequested(chapter.page)) {
+            $0.chapterEditingTarget = target
+            $0.chapterTitle = chapter.name
+        }
+        await store.send(.confirmChapterDeletion) {
+            $0.chapterEditingTarget = nil
+            $0.chapterTitle = ""
+            $0.chapterRequestInFlight = true
+        }
+        await store.receive(.chapterDeleteFailed(target: target, title: chapter.name)) {
+            $0.chapterRequestInFlight = false
+            $0.chapterEditingTarget = target
+            $0.chapterTitle = chapter.name
+            $0.errorMessage = String(localized: "archive.reader.chapter.delete.failed")
+        }
+        XCTAssertEqual(store.state.chapters, [chapter])
+    }
+
+    @MainActor
+    func testAutomaticTankoubonChapterCannotBeEdited() async {
+        configureReaderDefaults()
+
+        let tankId = "TANK_test"
+        let manualFirstPage = ArchiveChapter(name: "Manual", page: 1)
+        let automaticFirstPage = ArchiveChapter(name: "Source 2", page: 3)
+        var initialState = makeState(
+            archiveId: tankId,
+            allArchives: [makeArchive(id: tankId, toc: [manualFirstPage, automaticFirstPage])]
+        )
+        initialState.pages = [
+            PageFeature.State(
+                archiveId: tankId,
+                pageId: "first",
+                pageNumber: 1,
+                sourceArchiveId: "source-1",
+                sourcePageNumber: 1
+            ),
+            PageFeature.State(
+                archiveId: tankId,
+                pageId: "second",
+                pageNumber: 3,
+                sourceArchiveId: "source-2",
+                sourcePageNumber: 1
+            )
+        ]
+        var details = makeTankoubonDetailsMetadata(
+            tankId: tankId,
+            toc: [manualFirstPage, automaticFirstPage]
+        )
+        details.automaticChapterPages = [3]
+        initialState.currentTankoubonDetails = details
+        let store = makeTestStore(initialState: initialState)
+
+        XCTAssertEqual(store.state.editableChapterPages, [1])
+        await store.send(.chapterEditingRequested(automaticFirstPage.page))
+
+        let target = ChapterMutationTarget(
+            readerArchiveId: tankId,
+            readerPageNumber: 1,
+            sourceArchiveId: "source-1",
+            sourcePageNumber: 1
+        )
+        await store.send(.chapterEditingRequested(manualFirstPage.page)) {
+            $0.chapterEditingTarget = target
+            $0.chapterTitle = "Manual"
         }
     }
 
@@ -1422,10 +1778,9 @@ final class ArchiveReaderFeatureTests: XCTestCase {
             $0.appDatabase = database
         }
 
-        await store.send(.extractArchive) {
-            $0.extracting = true
-        }
+        await store.send(.extractArchive) { $0.extracting = true }
         await store.receive(.stampsSupportResolved(false)) { $0.stampsSupported = false }
+        await store.receive(.chapterMutationSupportResolved(false)) { $0.chapterMutationsSupported = false }
         await store.receive(
             .finishExtracting(
                 extractedPages,
@@ -2618,6 +2973,85 @@ final class ArchiveReaderFeatureTests: XCTestCase {
     }
 
     @MainActor
+    func testUIPageCollectionPreloadsNextPageAfterInitialRestore() async throws {
+        configureReaderDefaults()
+        let (store, controller) = try makeInitialRestoreReader(
+            archiveId: "initial-preload",
+            pageCount: 3,
+            targetPageIndex: 0
+        )
+        await waitForScrollRequestToFinish(store)
+        await waitForPageToLoad(store, pageId: "2-normal")
+
+        XCTAssertTrue(store.pages[id: "2-normal"]?.imageLoaded == true)
+        _ = controller
+    }
+
+    @MainActor
+    func testUIPageCollectionPreloadsAfterRestoredMiddlePage() async throws {
+        configureReaderDefaults()
+        let (store, controller) = try makeInitialRestoreReader(
+            archiveId: "middle-preload",
+            pageCount: 5,
+            targetPageIndex: 2
+        )
+        await waitForScrollRequestToFinish(store)
+        await waitForPageToLoad(store, pageId: "4-normal")
+
+        XCTAssertTrue(store.pages[id: "4-normal"]?.imageLoaded == true)
+        _ = controller
+    }
+
+    @MainActor
+    func testUIPageCollectionPreloadsNextSpreadAfterInitialRestore() async throws {
+        configureReaderDefaults(doublePageLayout: true)
+        let (store, controller) = try makeInitialRestoreReader(
+            archiveId: "spread-preload",
+            pageCount: 5,
+            targetPageIndex: 1,
+            doublePageLayout: true
+        )
+        await waitForScrollRequestToFinish(store)
+        await waitForPageToLoad(store, pageId: "3-normal")
+        await waitForPageToLoad(store, pageId: "4-normal")
+
+        XCTAssertTrue(store.pages[id: "3-normal"]?.imageLoaded == true)
+        XCTAssertTrue(store.pages[id: "4-normal"]?.imageLoaded == true)
+        _ = controller
+    }
+
+    @MainActor
+    func testUIPageCollectionDoesNotPreloadPastFinalPage() async throws {
+        configureReaderDefaults()
+        let (store, controller) = try makeInitialRestoreReader(
+            archiveId: "final-page-preload",
+            pageCount: 3,
+            targetPageIndex: 2
+        )
+        await waitForScrollRequestToFinish(store)
+        await waitForPageToLoad(store, pageId: "3-normal")
+
+        XCTAssertFalse(store.pages[id: "2-normal"]?.imageLoaded == true)
+        _ = controller
+    }
+
+    @MainActor
+    func testUIPageCollectionPreloadsNextPageInVerticalReader() async throws {
+        configureReaderDefaults(readDirection: .upDown)
+        let (store, controller) = try makeInitialRestoreReader(
+            archiveId: "vertical-preload",
+            pageCount: 4,
+            targetPageIndex: 1,
+            readDirection: .upDown
+        )
+        await waitForScrollRequestToFinish(store)
+        await waitForPageToLoad(store, pageId: "3-normal")
+
+        XCTAssertTrue(store.pages[id: "3-normal"]?.imageLoaded == true)
+        _ = controller
+    }
+
+    @MainActor
     func testUIPageCollectionDoesNotOverwriteRestoredPageDuringInitialSnapshot() async {
         configureReaderDefaults()
         var initialState = makeState(progress: 3)
@@ -3390,6 +3824,63 @@ private func waitForScrollRequestToFinish(_ store: StoreOf<ArchiveReaderFeature>
 }
 
 @MainActor
+private func makeInitialRestoreReader(
+    archiveId: String,
+    pageCount: Int,
+    targetPageIndex: Int,
+    readDirection: ReadDirection = .leftRight,
+    doublePageLayout: Bool = false
+) throws -> (StoreOf<ArchiveReaderFeature>, UIPageCollectionController) {
+    var initialState = makeState(
+        archiveId: archiveId,
+        progress: targetPageIndex + 1,
+        cached: true,
+        readDirection: readDirection,
+        doublePageLayout: doublePageLayout
+    )
+    initialState.pages = IdentifiedArray(
+        uniqueElements: (1...pageCount).map {
+            PageFeature.State(
+                archiveId: archiveId,
+                pageId: "\($0)",
+                pageNumber: $0,
+                cached: true
+            )
+        }
+    )
+    initialState.currentPageIndex = targetPageIndex
+    initialState.scrollRequest = ScrollRequest(
+        targetPageIndex: targetPageIndex,
+        source: .initialRestore,
+        animated: false
+    )
+
+    let database = try makeInMemoryDatabase()
+    let store = Store(initialState: initialState) {
+        ArchiveReaderFeature()
+    } withDependencies: {
+        $0.continuousClock = ImmediateClock()
+        $0.appDatabase = database
+    }
+    let controller = UIPageCollectionController(store: store)
+    controller.loadViewIfNeeded()
+    controller.collectionView.isPrefetchingEnabled = false
+    controller.view.frame = CGRect(x: 0, y: 0, width: 320, height: 480)
+    controller.view.layoutIfNeeded()
+    return (store, controller)
+}
+
+@MainActor
+private func waitForPageToLoad(
+    _ store: StoreOf<ArchiveReaderFeature>,
+    pageId: PageFeature.State.ID
+) async {
+    for _ in 0..<100 where store.pages[id: pageId]?.imageLoaded != true {
+        try? await Task<Never, Never>.sleep(for: .milliseconds(10))
+    }
+}
+
+@MainActor
 private func waitForStampsToLoad(
     _ store: StoreOf<ArchiveReaderFeature>,
     pageId: String
@@ -3852,10 +4343,16 @@ private func makeTankoubonChapterFixture(tankId: String) -> TankoubonChapterFixt
         ArchiveChapter(name: "Source 1", page: 3),
         ArchiveChapter(name: "Bonus", page: 4)
     ]
+    var metadata = makeTankoubonDetailsMetadata(tankId: tankId, toc: expectedChapters)
+    metadata.automaticChapterPages = [3]
+    metadata.defaultChapters = [
+        ArchiveChapter(name: "Source 0", page: 1),
+        ArchiveChapter(name: "Source 1", page: 3)
+    ]
     return TankoubonChapterFixture(
         sourceTOCs: sourceTOCs,
         expectedChapters: expectedChapters,
-        metadata: makeTankoubonDetailsMetadata(tankId: tankId, toc: expectedChapters)
+        metadata: metadata
     )
 }
 
@@ -4031,6 +4528,34 @@ private func stubArchiveStampsFailure(archiveId: String, page: Int, statusCode: 
         HTTPStubsResponse(
             data: Data("{\"error\":\"stamps unavailable\"}".utf8),
             statusCode: statusCode,
+            headers: ["Content-Type": "application/json"]
+        )
+    }
+}
+
+private func stubAddArchiveChapter(archiveId: String, page: Int, title: String, success: Int = 1) {
+    stub(condition: isHost("localhost")
+            && isPath("/api/archives/\(archiveId)/toc")
+            && containsQueryParams(["page": "\(page)", "title": title])
+            && isMethodPUT()
+            && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")) { _ in
+        HTTPStubsResponse(
+            data: Data("{\"operation\":\"update_toc\",\"success\":\(success)}".utf8),
+            statusCode: 200,
+            headers: ["Content-Type": "application/json"]
+        )
+    }
+}
+
+private func stubDeleteArchiveChapter(archiveId: String, page: Int, success: Int = 1) {
+    stub(condition: isHost("localhost")
+            && isPath("/api/archives/\(archiveId)/toc")
+            && containsQueryParams(["page": "\(page)"])
+            && isMethodDELETE()
+            && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")) { _ in
+        HTTPStubsResponse(
+            data: Data("{\"operation\":\"remove_toc\",\"success\":\(success)}".utf8),
+            statusCode: 200,
             headers: ["Content-Type": "application/json"]
         )
     }
