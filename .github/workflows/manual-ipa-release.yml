@@ -2,6 +2,11 @@ name: Manual IPA Release
 
 on:
   workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Full commit SHA to release (blank uses current master)
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -21,6 +26,48 @@ jobs:
         run: |
           if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
             echo "Releases must be dispatched from master; got $GITHUB_REF."
+            exit 1
+          fi
+
+      - name: Select release source
+        id: source
+        shell: bash
+        env:
+          REQUESTED_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          source_commit="${REQUESTED_COMMIT:-$GITHUB_SHA}"
+
+          if [[ ! "$source_commit" =~ ^[[:xdigit:]]{40}$ ]]; then
+            echo "Source commit must be a full 40-character SHA."
+            exit 1
+          fi
+
+          if ! git cat-file -e "${source_commit}^{commit}"; then
+            echo "Source commit $source_commit was not found."
+            exit 1
+          fi
+
+          source_commit="$(git rev-parse "${source_commit}^{commit}")"
+          if ! git merge-base --is-ancestor "$source_commit" "$GITHUB_SHA"; then
+            echo "Source commit $source_commit is not in master's history."
+            exit 1
+          fi
+
+          echo "commit=$source_commit" >> "$GITHUB_OUTPUT"
+          if git diff --quiet "$source_commit" "$GITHUB_SHA" -- .github/workflows; then
+            echo "needs_workflow_token=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_workflow_token=true" >> "$GITHUB_OUTPUT"
+          fi
+          git checkout --detach "$source_commit"
+
+      - name: Require historical release token
+        if: steps.source.outputs.needs_workflow_token == 'true'
+        env:
+          HISTORICAL_RELEASE_TOKEN: ${{ secrets.HISTORICAL_RELEASE_TOKEN }}
+        run: |
+          if [[ -z "$HISTORICAL_RELEASE_TOKEN" ]]; then
+            echo "::error::Set the HISTORICAL_RELEASE_TOKEN repository secret with Contents and Workflows write permissions."
             exit 1
           fi
 
@@ -128,11 +175,19 @@ jobs:
 
           echo "ipa_path=$ipa_path" >> "$GITHUB_OUTPUT"
 
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LANreader-${{ steps.versions.outputs.tag }}
+          path: ${{ steps.package.outputs.ipa_path }}
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Create GitHub release and upload IPA
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.source.outputs.needs_workflow_token == 'true' && secrets.HISTORICAL_RELEASE_TOKEN || github.token }}
         run: |
           gh release create "${{ steps.versions.outputs.tag }}" "${{ steps.package.outputs.ipa_path }}#LANreader.ipa" \
-            --target "$GITHUB_SHA" \
+            --target "${{ steps.source.outputs.commit }}" \
             --title "v${{ steps.versions.outputs.marketing_version }}" \
             --generate-notes
