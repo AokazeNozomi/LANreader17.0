@@ -27,6 +27,7 @@ actor LANraragiService {
     private static let logger = Logger(label: "LANraragiService")
 
     private static let newAPIMinVersion = "0.9.70"
+    private static let stampsMinVersion = "0.9.80"
 
     static let shared = LANraragiService()
 
@@ -40,6 +41,8 @@ actor LANraragiService {
     private var urlSessionDelegate: URLSessionDelegateHandler?
 
     private(set) var useNewAPI: Bool = false
+    private(set) var supportsStamps: Bool?
+    private(set) var supportsChapterMutations: Bool?
 
     private init() {
         self.session = Session(interceptor: authInterceptor)
@@ -85,7 +88,7 @@ actor LANraragiService {
         self.url = url
         self.authInterceptor = result.interceptor
         self.session = result.session
-        updateAPIVersionFlag(serverVersion: result.serverInfo.version)
+        updateServerCapabilities(serverVersion: result.serverInfo.version)
         return result.serverInfo
     }
 
@@ -100,15 +103,34 @@ actor LANraragiService {
 
         do {
             let result = try await fetchServerInfo(url: storedUrl, apiKey: storedApiKey)
-            updateAPIVersionFlag(serverVersion: result.serverInfo.version)
+            updateServerCapabilities(serverVersion: result.serverInfo.version)
         } catch {
             Self.logger.warning("Failed to check server version at startup: \(error.localizedDescription)")
         }
     }
 
-    func updateAPIVersionFlag(serverVersion: String) {
+    func stampSupportForCurrentServer() async -> Bool? {
+        if supportsStamps == nil {
+            await checkServerVersionAtStartup()
+        }
+        return supportsStamps
+    }
+
+    func chapterMutationSupportForCurrentServer() async -> Bool? {
+        if supportsChapterMutations == nil {
+            await checkServerVersionAtStartup()
+        }
+        return supportsChapterMutations
+    }
+
+    func updateServerCapabilities(serverVersion: String) {
         self.useNewAPI = Self.compareVersions(serverVersion, isAtLeast: Self.newAPIMinVersion)
-        Self.logger.info("Server version: \(serverVersion), using new API: \(self.useNewAPI)")
+        self.supportsStamps = Self.compareVersions(serverVersion, isAtLeast: Self.stampsMinVersion)
+        self.supportsChapterMutations = self.useNewAPI
+        let supportsStamps = self.supportsStamps == true
+        Self.logger.info(
+            "Server version: \(serverVersion), using new API: \(self.useNewAPI), supports stamps: \(supportsStamps)"
+        )
     }
 
     private static func compareVersions(_ version: String, isAtLeast minVersion: String) -> Bool {
@@ -283,6 +305,7 @@ actor LANraragiService {
 
     func updateTankoubon(
         id: String,
+        archives: [String]? = nil,
         name: String? = nil,
         summary: String? = nil,
         tags: String? = nil,
@@ -300,7 +323,7 @@ actor LANraragiService {
             metadata = nil
         }
 
-        let request = TankoubonUpdateRequest(metadata: metadata)
+        let request = TankoubonUpdateRequest(archives: archives, metadata: metadata)
         return session.request(
             "\(url)/api/tankoubons/\(id)",
             method: .put,
@@ -309,6 +332,17 @@ actor LANraragiService {
         )
         .validate(statusCode: 200...200)
         .serializingDecodable(GenericSuccessResponse.self)
+    }
+
+    func createTankoubon(name: String) async -> DataTask<TankoubonCreateResponse> {
+        session.request(
+            "\(url)/api/tankoubons",
+            method: .put,
+            parameters: ["name": name],
+            encoding: URLEncoding(destination: .httpBody)
+        )
+        .validate(statusCode: 200...200)
+        .serializingDecodable(TankoubonCreateResponse.self)
     }
 
     func deleteTankoubon(id: String) async -> DataTask<GenericSuccessResponse> {
@@ -391,6 +425,70 @@ actor LANraragiService {
                 .validate()
                 .serializingDecodable(ArchiveExtractResponse.self)
         }
+    }
+
+    func retrieveStamps(id: String, page: Int) async -> DataTask<ArchiveStampsResponse> {
+        session.request("\(url)/api/archives/\(id)/stamps/\(page)", method: .get)
+            .validate(statusCode: 200...200)
+            .serializingDecodable(ArchiveStampsResponse.self)
+    }
+
+    func addArchiveChapter(id: String, page: Int, title: String) async -> DataTask<GenericSuccessResponse> {
+        session.request(
+            "\(url)/api/archives/\(id)/toc",
+            method: .put,
+            parameters: ["page": page, "title": title],
+            encoding: URLEncoding(destination: .queryString)
+        )
+        .validate(statusCode: 200...200)
+        .serializingDecodable(GenericSuccessResponse.self)
+    }
+
+    func deleteArchiveChapter(id: String, page: Int) async -> DataTask<GenericSuccessResponse> {
+        session.request(
+            "\(url)/api/archives/\(id)/toc",
+            method: .delete,
+            parameters: ["page": page],
+            encoding: URLEncoding(destination: .queryString)
+        )
+        .validate(statusCode: 200...200)
+        .serializingDecodable(GenericSuccessResponse.self)
+    }
+
+    func addStamp(
+        id: String,
+        page: Int,
+        content: String,
+        position: String
+    ) async -> DataTask<AddStampResponse> {
+        session.request(
+            "\(url)/api/archives/\(id)/stamps/\(page)",
+            method: .put,
+            parameters: [
+                "content": content,
+                "position": position
+            ],
+            encoding: URLEncoding(destination: .queryString)
+        )
+        .validate(statusCode: 200...200)
+        .serializingDecodable(AddStampResponse.self)
+    }
+
+    func updateStamp(id: String, content: String) async -> DataTask<GenericSuccessResponse> {
+        session.request(
+            "\(url)/api/stamps/\(id)",
+            method: .put,
+            parameters: ["content": content],
+            encoding: URLEncoding(destination: .queryString)
+        )
+        .validate(statusCode: 200...200)
+        .serializingDecodable(GenericSuccessResponse.self)
+    }
+
+    func deleteStamp(id: String) async -> DataTask<GenericSuccessResponse> {
+        session.request("\(url)/api/stamps/\(id)", method: .delete)
+            .validate(statusCode: 200...200)
+            .serializingDecodable(GenericSuccessResponse.self)
     }
 
     private func resolveArchivePageURL(page: String) -> URL {

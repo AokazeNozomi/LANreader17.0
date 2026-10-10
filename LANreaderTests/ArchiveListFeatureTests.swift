@@ -6,6 +6,42 @@ import OHHTTPStubsSwift
 @testable import LANreader
 
 final class ArchiveListFeatureTests: XCTestCase {
+
+    @MainActor
+    func testBatchDeleteRoutesTankoubonAndKeepsFailedSelection() async throws {
+        try await configureArchiveListTestClient()
+        for (path, success) in [("/api/archives/archive-0", 1), ("/api/tankoubons/TANK_1", 0)] {
+            stubArchiveListBatchDelete(path: path, success: success)
+        }
+        var state = ArchiveListFeature.State(
+            filter: SearchFilter(category: nil, filter: nil), loadOnAppear: false, currentTab: .library
+        )
+        state.$paginateArchiveList.withLock { $0 = false }
+        state.selectMode = .active
+        state.selected = ["archive-0", "TANK_1"]
+        state.archives = IdentifiedArray(uniqueElements: ["archive-0", "TANK_1", "unselected"].map {
+            GridFeature.State(archive: Shared(value: makeArchive(id: $0, fileExtension: "zip")))
+        })
+        state.archivesToDisplay = state.archives
+        let store = TestStore(initialState: state) { ArchiveListFeature() }
+        store.timeout = .seconds(5)
+        await store.send(.confirmDelete) {
+            $0.loading = true
+            $0.batchActionInProgress = true
+        }
+        await store.receive(.deleteFinished(["archive-0"], true)) {
+            $0.batchActionInProgress = false
+            $0.selected = ["TANK_1"]
+            $0.archives.remove(id: "archive-0")
+            $0.archivesToDisplay.remove(id: "archive-0")
+            $0.$archiveItems.withLock { _ = $0.remove(id: "archive-0") }
+            $0.loading = false
+            $0.errorMessage = String(localized: "archive.selected.delete.error")
+        }
+        await store.finish()
+        XCTAssertNotNil(store.state.archives[id: "unselected"])
+    }
+
     override func tearDownWithError() throws {
         UserDefaults.resetStandardUserDefaults()
         HTTPStubs.removeAllStubs()
@@ -36,7 +72,7 @@ final class ArchiveListFeatureTests: XCTestCase {
             ArchiveListFeature()
         }
 
-        await store.send(.load(true)) {
+        await store.send(.load) {
             $0.archives = []
             $0.archivesToDisplay = []
             $0.total = 0
@@ -52,19 +88,31 @@ final class ArchiveListFeatureTests: XCTestCase {
         XCTAssertTrue(state.canLoadArchives)
     }
 
+    func testSearchCancellationIsIsolatedPerArchiveList() {
+        let first = ArchiveListFeature.State(
+            filter: SearchFilter(category: nil, filter: nil),
+            currentTab: .library
+        )
+        let second = ArchiveListFeature.State(
+            filter: SearchFilter(category: nil, filter: nil),
+            currentTab: .library
+        )
+
+        XCTAssertNotEqual(first.searchCancellationID, second.searchCancellationID)
+    }
+
     @MainActor
     func testPageZeroResponseDefinesServerPageSize() async {
-        let store = TestStore(initialState: makePaginatedState()) {
+        let store = TestStore(initialState: makePaginatedArchiveListState()) {
             ArchiveListFeature()
         }
 
         await store.send(.populateArchives(makeArchives(count: 100), 250, false)) {
-            $0.archives = expectedGridStates(in: &$0, count: 100)
+            $0.archives = expectedArchiveListGridStates(in: &$0, count: 100)
             $0.archivesToDisplay = $0.archives
             $0.serverPageSize = 100
             $0.total = 250
             $0.loading = false
-            $0.showLoading = false
         }
 
         XCTAssertEqual(store.state.pageCount, 3)
@@ -72,7 +120,7 @@ final class ArchiveListFeatureTests: XCTestCase {
 
     @MainActor
     func testShortFinalPageDoesNotShrinkServerPageSize() async {
-        var initialState = makePaginatedState()
+        var initialState = makePaginatedArchiveListState()
         initialState.serverPageSize = 100
         initialState.total = 250
         initialState.currentPage = 2
@@ -83,10 +131,9 @@ final class ArchiveListFeatureTests: XCTestCase {
 
         // The last page returns fewer records; the discovered size must survive it.
         await store.send(.populateArchives(makeArchives(count: 50), 250, false)) {
-            $0.archives = expectedGridStates(in: &$0, count: 50)
+            $0.archives = expectedArchiveListGridStates(in: &$0, count: 50)
             $0.archivesToDisplay = $0.archives
             $0.loading = false
-            $0.showLoading = false
         }
 
         XCTAssertEqual(store.state.serverPageSize, 100)
@@ -113,7 +160,7 @@ final class ArchiveListFeatureTests: XCTestCase {
 
     @MainActor
     func testGoToPageIsIgnoredForRandomSort() async {
-        var initialState = makePaginatedState()
+        var initialState = makePaginatedArchiveListState()
         initialState.$searchSort = Shared(value: SearchSort.random.rawValue)
         initialState.serverPageSize = 100
         initialState.total = 250
@@ -128,10 +175,10 @@ final class ArchiveListFeatureTests: XCTestCase {
 
     @MainActor
     func testGoToPageRequestsMatchingServerOffset() async throws {
-        try await configureVerifiedClient()
+        try await configureArchiveListTestClient()
         stubSearchExpectingStart("200", recordsFiltered: 250)
 
-        var initialState = makePaginatedState()
+        var initialState = makePaginatedArchiveListState()
         initialState.serverPageSize = 100
         initialState.total = 250
 
@@ -142,7 +189,6 @@ final class ArchiveListFeatureTests: XCTestCase {
 
         await store.send(.goToPage(2)) {
             $0.loading = true
-            $0.showLoading = true
             $0.pendingPage = 2
         }
         // Only a request with start=200 is stubbed, so reaching populateArchives proves the offset.
@@ -151,16 +197,15 @@ final class ArchiveListFeatureTests: XCTestCase {
             $0.pendingPage = nil
             $0.total = 250
             $0.loading = false
-            $0.showLoading = false
         }
     }
 
     @MainActor
     func testGoToPageClampsBeyondLastPage() async throws {
-        try await configureVerifiedClient()
+        try await configureArchiveListTestClient()
         stubSearchExpectingStart("200", recordsFiltered: 250)
 
-        var initialState = makePaginatedState()
+        var initialState = makePaginatedArchiveListState()
         initialState.serverPageSize = 100
         initialState.total = 250
 
@@ -171,7 +216,6 @@ final class ArchiveListFeatureTests: XCTestCase {
 
         await store.send(.goToPage(99)) {
             $0.loading = true
-            $0.showLoading = true
             $0.pendingPage = 2
         }
         await store.receive(.populateArchives([], 250, false)) {
@@ -179,19 +223,18 @@ final class ArchiveListFeatureTests: XCTestCase {
             $0.pendingPage = nil
             $0.total = 250
             $0.loading = false
-            $0.showLoading = false
         }
     }
 
     @MainActor
     func testFailedPageRequestKeepsCurrentPageAndArchives() async throws {
-        try await configureVerifiedClient()
+        try await configureArchiveListTestClient()
         stubFailedSearchExpectingStart("200")
 
-        var initialState = makePaginatedState()
+        var initialState = makePaginatedArchiveListState()
         initialState.serverPageSize = 100
         initialState.total = 250
-        initialState.archives = expectedGridStates(in: &initialState, count: 1)
+        initialState.archives = expectedArchiveListGridStates(in: &initialState, count: 1)
         initialState.archivesToDisplay = initialState.archives
 
         let store = TestStore(initialState: initialState) {
@@ -202,7 +245,6 @@ final class ArchiveListFeatureTests: XCTestCase {
 
         await store.send(.goToPage(2)) {
             $0.loading = true
-            $0.showLoading = true
             $0.pendingPage = 2
         }
         await store.receive(\.setErrorMessage)
@@ -213,11 +255,31 @@ final class ArchiveListFeatureTests: XCTestCase {
     }
 
     @MainActor
+    func testClearingErrorMessagePreservesPendingLoadState() async {
+        var initialState = ArchiveListFeature.State(
+            filter: SearchFilter(category: nil, filter: nil),
+            loadOnAppear: false,
+            currentTab: .library
+        )
+        initialState.loading = true
+        initialState.pendingPage = 2
+        initialState.errorMessage = "Cache failed"
+
+        let store = TestStore(initialState: initialState) {
+            ArchiveListFeature()
+        }
+
+        await store.send(.setErrorMessage("")) {
+            $0.errorMessage = ""
+        }
+    }
+
+    @MainActor
     func testLoadKeepsCurrentPageInPaginationMode() async throws {
-        try await configureVerifiedClient()
+        try await configureArchiveListTestClient()
         stubSearchExpectingStart("200", recordsFiltered: 250)
 
-        var initialState = makePaginatedState()
+        var initialState = makePaginatedArchiveListState()
         initialState.serverPageSize = 100
         initialState.total = 250
         initialState.currentPage = 2
@@ -226,42 +288,37 @@ final class ArchiveListFeatureTests: XCTestCase {
             ArchiveListFeature()
         }
         store.timeout = .seconds(5)
-        // populateTags stamps a shared timestamp that is irrelevant here.
         store.exhaustivity = .off
 
-        await store.send(.load(true)) {
+        await store.send(.load) {
             $0.loading = true
-            $0.showLoading = true
         }
         // Only start=200 is stubbed, so reaching populateArchives proves the page was kept.
         await store.receive(.populateArchives([], 250, false)) {
             $0.total = 250
             $0.loading = false
-            $0.showLoading = false
         }
         XCTAssertEqual(store.state.currentPage, 2)
     }
 
     @MainActor
     func testReloadFromFirstPageRestartsWhileAnotherRequestIsLoading() async throws {
-        try await configureVerifiedClient()
+        try await configureArchiveListTestClient()
         stubSearchExpectingStart("0", recordsFiltered: 250)
 
-        var initialState = makePaginatedState()
+        var initialState = makePaginatedArchiveListState()
         initialState.serverPageSize = 100
         initialState.total = 250
         initialState.currentPage = 2
         initialState.pendingPage = 2
         initialState.loading = true
-        initialState.showLoading = true
-        initialState.archives = expectedGridStates(in: &initialState, count: 1)
+        initialState.archives = expectedArchiveListGridStates(in: &initialState, count: 1)
         initialState.archivesToDisplay = initialState.archives
 
         let store = TestStore(initialState: initialState) {
             ArchiveListFeature()
         }
         store.timeout = .seconds(5)
-        // populateTags stamps a shared timestamp that is irrelevant here.
         store.exhaustivity = .off
 
         await store.send(.reloadFromFirstPage) {
@@ -278,10 +335,10 @@ final class ArchiveListFeatureTests: XCTestCase {
 
     @MainActor
     func testResetArchivesSendsLoadBackToFirstPage() async throws {
-        try await configureVerifiedClient()
+        try await configureArchiveListTestClient()
         stubSearchExpectingStart("0", recordsFiltered: 250)
 
-        var initialState = makePaginatedState()
+        var initialState = makePaginatedArchiveListState()
         initialState.serverPageSize = 100
         initialState.total = 250
         initialState.currentPage = 2
@@ -295,25 +352,23 @@ final class ArchiveListFeatureTests: XCTestCase {
         await store.send(.resetArchives) {
             $0.currentPage = 0
         }
-        await store.send(.load(true)) {
+        await store.send(.load) {
             $0.loading = true
-            $0.showLoading = true
         }
         await store.receive(.populateArchives([], 250, false)) {
             $0.total = 250
             $0.loading = false
-            $0.showLoading = false
         }
         XCTAssertEqual(store.state.currentPage, 0)
     }
 
     @MainActor
     func testLoadFallsBackWhenCurrentPageNoLongerExists() async throws {
-        try await configureVerifiedClient()
+        try await configureArchiveListTestClient()
         stubSearchExpectingStart("200", recordsFiltered: 150)
         stubSearchExpectingStart("100", recordsFiltered: 150)
 
-        var initialState = makePaginatedState()
+        var initialState = makePaginatedArchiveListState()
         initialState.serverPageSize = 100
         initialState.total = 250
         initialState.currentPage = 2
@@ -324,26 +379,26 @@ final class ArchiveListFeatureTests: XCTestCase {
         store.timeout = .seconds(5)
         store.exhaustivity = .off
 
-        await store.send(.load(true))
+        await store.send(.load)
         // The shrunken total leaves page 2 out of range, so the reducer retries the last page.
         await store.receive(.populateArchives([], 150, false)) {
             $0.currentPage = 1
         }
-        await store.receive(.load(false))
+        await store.receive(.load)
         await store.receive(.populateArchives([], 150, false))
         XCTAssertEqual(store.state.currentPage, 1)
     }
 
     @MainActor
     func testDeletingLastPageReloadsPreviousPage() async throws {
-        try await configureVerifiedClient()
+        try await configureArchiveListTestClient()
         stubSearchExpectingStart("0", recordsFiltered: 100)
 
-        var initialState = makePaginatedState()
+        var initialState = makePaginatedArchiveListState()
         initialState.serverPageSize = 100
         initialState.total = 101
         initialState.currentPage = 1
-        initialState.archives = expectedGridStates(in: &initialState, count: 1)
+        initialState.archives = expectedArchiveListGridStates(in: &initialState, count: 1)
         initialState.archivesToDisplay = initialState.archives
 
         let store = TestStore(initialState: initialState) {
@@ -352,11 +407,11 @@ final class ArchiveListFeatureTests: XCTestCase {
         store.timeout = .seconds(5)
         store.exhaustivity = .off
 
-        await store.send(.deleteSuccess(["archive-0"])) {
+        await store.send(.deleteFinished(["archive-0"], false)) {
             $0.total = 100
             $0.currentPage = 0
         }
-        await store.receive(.load(false))
+        await store.receive(.load)
         // Only start=0 is stubbed, so the response proves the reducer reloaded the valid page.
         await store.receive(.populateArchives([], 100, false))
 
@@ -366,7 +421,7 @@ final class ArchiveListFeatureTests: XCTestCase {
 
     @MainActor
     func testPagerHiddenUntilThereIsMoreThanOnePage() {
-        var state = makePaginatedState()
+        var state = makePaginatedArchiveListState()
         state.serverPageSize = 100
 
         state.total = 80
@@ -409,14 +464,69 @@ final class ArchiveListFeatureTests: XCTestCase {
     }
 
     @MainActor
+    func testCacheArchiveFromListSavesDownloadMetadata() async throws {
+        try await configureArchiveListTestClient()
+
+        let archiveId = "archive-to-cache"
+        try stubArchiveListExtraction(
+            id: archiveId,
+            pages: [
+                "./api/archives/\(archiveId)/page?path=001.jpg",
+                "./api/archives/\(archiveId)/page?path=002.jpg"
+            ]
+        )
+        let archive = ArchiveItem(
+            id: archiveId,
+            name: "Archive to Cache",
+            extension: "zip",
+            tags: "artist:Example",
+            isNew: false,
+            progress: 1,
+            pagecount: 2,
+            dateAdded: nil,
+            toc: [ArchiveChapter(name: "Chapter", page: 1)]
+        )
+        var initialState = ArchiveListFeature.State(
+            filter: SearchFilter(category: nil, filter: nil),
+            loadOnAppear: false,
+            currentTab: .library
+        )
+        initialState.archives = [GridFeature.State(archive: Shared(value: archive))]
+
+        let database = try makeArchiveListTestDatabase()
+        let store = TestStore(initialState: initialState) {
+            ArchiveListFeature()
+        } withDependencies: {
+            $0.appDatabase = database
+        }
+        store.timeout = .seconds(5)
+
+        await store.send(.cacheArchive(archiveId)) {
+            $0.cachingArchiveIds = [archiveId]
+        }
+        await store.receive(.cacheArchiveFinished(archiveId)) {
+            $0.cachingArchiveIds = []
+            $0.successMessage = String(localized: "archive.cache.added")
+        }
+
+        let cache = try XCTUnwrap(database.readCache(archiveId))
+        XCTAssertEqual(cache.title, archive.name)
+        XCTAssertEqual(cache.tags, archive.tags)
+        XCTAssertEqual(cache.totalPages, 2)
+        XCTAssertEqual(cache.toc, archive.toc)
+        XCTAssertEqual(cache.progress, archive.progress)
+        XCTAssertFalse(cache.cached)
+    }
+
+    @MainActor
     func testGridLoadUsesArchiveThumbnailEndpointForNormalArchive() async throws {
-        try await configureVerifiedClient()
+        try await configureArchiveListTestClient()
 
         let archiveId = "0123456789012345678901234567890123456789"
         let expectedThumbnail = Data([0xFF, 0xD8, 0xFF, 0xDB])
         stubArchiveThumbnail(id: archiveId, data: expectedThumbnail)
 
-        let database = try makeInMemoryDatabase()
+        let database = try makeArchiveListTestDatabase()
         let store = makeGridTestStore(
             archive: makeArchive(id: archiveId, fileExtension: "zip"),
             database: database
@@ -433,13 +543,13 @@ final class ArchiveListFeatureTests: XCTestCase {
 
     @MainActor
     func testGridLoadUsesTankoubonThumbnailEndpointForTankArchive() async throws {
-        try await configureVerifiedClient()
+        try await configureArchiveListTestClient()
 
         let tankId = "TANK_1783084742"
         let expectedThumbnail = Data([0x89, 0x50, 0x4E, 0x47])
         stubTankoubonThumbnail(id: tankId, data: expectedThumbnail)
 
-        let database = try makeInMemoryDatabase()
+        let database = try makeArchiveListTestDatabase()
         let store = makeGridTestStore(
             archive: makeArchive(id: tankId, fileExtension: ".tank"),
             database: database
@@ -456,7 +566,20 @@ final class ArchiveListFeatureTests: XCTestCase {
 
 }
 
-private func configureVerifiedClient() async throws {
+func stubArchiveListBatchDelete(path: String, success: Int) {
+    stub(condition: isHost("localhost") && isPath(path) && isMethodDELETE()
+            && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")) { request in
+        XCTAssertNil(request.url?.query)
+        XCTAssertNil(request.httpBody)
+        XCTAssertNil(request.httpBodyStream)
+        return HTTPStubsResponse(
+            data: Data("{\"success\":\(success)}".utf8), statusCode: 200,
+            headers: ["Content-Type": "application/json"]
+        )
+    }
+}
+
+func configureArchiveListTestClient() async throws {
     let url = "https://localhost"
     let apiKey = "apiKey"
     UserDefaults.standard.set(url, forKey: SettingsKey.lanraragiUrl)
@@ -527,6 +650,16 @@ private func stubArchiveThumbnail(id: String, data: Data) {    stub(condition: i
     }
 }
 
+func stubArchiveListExtraction(id: String, pages: [String]) throws {
+    let data = try JSONSerialization.data(withJSONObject: ["pages": pages])
+    stub(condition: isHost("localhost")
+            && isPath("/api/archives/\(id)/extract")
+            && isMethodPOST()
+            && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")) { _ in
+        HTTPStubsResponse(data: data, statusCode: 200, headers: ["Content-Type": "application/json"])
+    }
+}
+
 private func stubTankoubonThumbnail(id: String, data: Data) {
     stub(condition: isHost("localhost")
             && isPath("/api/tankoubons/\(id)/thumbnail")
@@ -542,15 +675,17 @@ private func makeGridTestStore(
     archive: ArchiveItem,
     database: AppDatabase
 ) -> TestStoreOf<GridFeature> {
-    TestStore(initialState: GridFeature.State(archive: Shared(value: archive))) {
+    let store = TestStore(initialState: GridFeature.State(archive: Shared(value: archive))) {
         GridFeature()
     } withDependencies: {
         $0.appDatabase = database
     }
+    store.timeout = .seconds(5)
+    return store
 }
 
 @MainActor
-private func makePaginatedState() -> ArchiveListFeature.State {
+func makePaginatedArchiveListState() -> ArchiveListFeature.State {
     let state = ArchiveListFeature.State(
         filter: SearchFilter(category: nil, filter: nil),
         loadOnAppear: false,
@@ -560,6 +695,8 @@ private func makePaginatedState() -> ArchiveListFeature.State {
     state.$searchSort = Shared(value: SearchSort.dateAdded.rawValue)
     state.$searchSortOrder = Shared(value: SearchSortOrder.desc.rawValue)
     state.$hideRead = Shared(value: false)
+    // Pagination tests must not launch the unrelated detached tag-refresh request.
+    state.$lastTagRefresh = Shared(value: Date().timeIntervalSince1970)
     return state
 }
 
@@ -581,7 +718,7 @@ private func makeArchives(count: Int) -> [ArchiveItem] {
 /// Rebuilds the grid states the reducer derives from the shared archive store, so tests
 /// assert against the same `Shared` references rather than detached copies.
 @MainActor
-private func expectedGridStates(
+func expectedArchiveListGridStates(
     in state: inout ArchiveListFeature.State,
     count: Int
 ) -> IdentifiedArrayOf<GridFeature.State> {
@@ -608,6 +745,6 @@ private func makeArchive(id: String, fileExtension: String) -> ArchiveItem {    
     )
 }
 
-private func makeInMemoryDatabase() throws -> AppDatabase {
+func makeArchiveListTestDatabase() throws -> AppDatabase {
     try AppDatabase(DatabaseQueue())
 }

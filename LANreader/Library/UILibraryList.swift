@@ -15,7 +15,6 @@ import UIKit
         case binding(BindingAction<State>)
 
         case archiveList(ArchiveListFeature.Action)
-        case toggleSelectMode
     }
 
     @Dependency(\.lanraragiService) var service
@@ -28,21 +27,6 @@ import UIKit
             ArchiveListFeature()
         }
 
-        Reduce { state, action in
-            switch action {
-            case .toggleSelectMode:
-                if state.archiveList.selectMode == .inactive {
-                    state.archiveList.selectMode = .active
-                } else {
-                    state.archiveList.selectMode = .inactive
-                }
-                return .none
-            case .archiveList:
-                return .none
-            case .binding:
-                return .none
-            }
-        }
     }
 }
 
@@ -67,14 +51,16 @@ class UILibraryListViewController: UIViewController {
             target: self,
             action: #selector(tapCachedButton)
         )
-        navigationItem.leftBarButtonItems = [cachedButton]
+        navigationItem.leftBarButtonItems = store.archiveList.selectMode == .active ? [] : [cachedButton]
         navigationItem.title = String(localized: "library")
     }
 
     override func viewDidLoad() {
         super.viewDidLoad()
 
-        setupNavigationBar()
+        observe { [weak self] in
+            self?.setupNavigationBar()
+        }
 
         let archiveListView = UIArchiveListViewController(
             store: store.scope(\.archiveList, action: \.archiveList)
@@ -86,15 +72,6 @@ class UILibraryListViewController: UIViewController {
             archiveListView.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             archiveListView.view.trailingAnchor.constraint(equalTo: view.trailingAnchor)
         ])
-    }
-
-    override func viewWillAppear(_ animated: Bool) {
-        super.viewWillAppear(animated)
-        if #available(iOS 18.0, *) {
-            tabBarController?.setTabBarHidden(false, animated: false)
-        } else {
-            tabBarController?.tabBar.isHidden = false
-        }
     }
 
     @objc private func tapCachedButton() {

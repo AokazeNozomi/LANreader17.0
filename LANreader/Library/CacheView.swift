@@ -1,24 +1,30 @@
 import SwiftUI
 import ComposableArchitecture
-import NotificationBannerSwift
 
 @Reducer public struct CacheFeature: Sendable {
     @ObservableState
     public struct State: Equatable {
         var archives: IdentifiedArrayOf<GridFeature.State> = []
         var downloading: [String: PageProgress] = [:]
-        var showLoading: Bool = false
         var errorMessage: String = ""
+        var isSelecting = false
+        var selected: Set<String> = []
     }
 
     public enum Action: Equatable {
         case grid(IdentifiedActionOf<GridFeature>)
         case load
-        case refreshProgress
         case removeItemFromDownloading(String)
         case updateProgressInDownloading(String, Int)
         case removeCache(String)
+        case toggleSelectionMode
+        case toggleSelection(String)
+        case removeSelected
         case setErrorMessage(String)
+    }
+
+    private enum CancelID {
+        case progressPolling
     }
 
     @Dependency(\.appDatabase) var database
@@ -27,54 +33,44 @@ import NotificationBannerSwift
     public var body: some ReducerOf<Self> {
         Reduce { state, action in
             switch action {
-            case .load:
-                if let allCaches = try? database.readAllCached() {
-                    var gridStates: [GridFeature.State] = []
-                    for cache in allCaches {
-                        if !cache.cached {
-                            state.downloading[cache.id] = PageProgress(current: 0, total: cache.totalPages)
-                        }
-                        gridStates.append(
-                            GridFeature.State(
-                                archive: Shared(value: cache.toArchiveItem()),
-                                cached: true
-                            )
-                        )
-                    }
-                    state.archives = IdentifiedArray(uniqueElements: gridStates)
+            case .toggleSelectionMode:
+                state.isSelecting.toggle()
+                state.selected.removeAll()
+                return .none
+            case let .toggleSelection(id):
+                guard state.isSelecting, state.archives[id: id] != nil else { return .none }
+                if !state.selected.insert(id).inserted {
+                    state.selected.remove(id)
                 }
+                return .none
+            case .removeSelected:
+                let selected = state.selected.sorted()
                 return .run { send in
-                    await send(.refreshProgress)
+                    for id in selected {
+                        await send(.removeCache(id))
+                    }
                 }
-            case .refreshProgress:
-                return .run { [downloading = state.downloading] send in
-                    var inProgress = downloading
-                    repeat {
-                        for caching in inProgress {
-                            let cacheFolder = LANraragiService.cachePath!
-                                .appendingPathComponent(caching.key, conformingTo: .folder)
-                            if let content = try? FileManager.default.contentsOfDirectory(
-                                at: cacheFolder, includingPropertiesForKeys: []
-                            ) {
-                                let downloadPage = content.compactMap { url in
-                                    if let pageNumber = Int(url.deletingPathExtension().lastPathComponent) {
-                                        return pageNumber
-                                    } else {
-                                        return nil
-                                    }
-                                }.count
-                                if downloadPage >= caching.value.total {
-                                    await send(.removeItemFromDownloading(caching.key))
-                                    inProgress.removeValue(forKey: caching.key)
-                                    _ = try? database.updateCached(caching.key)
-                                } else {
-                                    await send(.updateProgressInDownloading(caching.key, downloadPage))
-                                }
-                            }
-                        }
-                        try await clock.sleep(for: .seconds(2))
-                    } while !inProgress.isEmpty
+            case .load:
+                guard let allCaches = try? database.readAllCached() else {
+                    return .cancel(id: CancelID.progressPolling)
                 }
+                var downloading: [String: PageProgress] = [:]
+                var gridStates: [GridFeature.State] = []
+                for cache in allCaches {
+                    if !cache.cached {
+                        downloading[cache.id] = PageProgress(current: 0, total: cache.totalPages)
+                    }
+                    gridStates.append(
+                        GridFeature.State(
+                            archive: Shared(value: cache.toArchiveItem()),
+                            cached: true
+                        )
+                    )
+                }
+                state.archives = IdentifiedArray(uniqueElements: gridStates)
+                state.selected.formIntersection(state.archives.ids)
+                state.downloading = downloading
+                return progressPollingEffect(downloading)
             case let .removeItemFromDownloading(id):
                 state.downloading.removeValue(forKey: id)
                 return .none
@@ -88,11 +84,12 @@ import NotificationBannerSwift
                     return .send(.setErrorMessage(errorMessage))
                 }
                 state.archives.remove(id: id)
+                state.selected.remove(id)
                 state.downloading.removeValue(forKey: id)
                 let cacheFolder = LANraragiService.cachePath!
                     .appendingPathComponent(id, conformingTo: .folder)
                 try? FileManager.default.removeItem(at: cacheFolder)
-                return .none
+                return progressPollingEffect(state.downloading)
             case let .setErrorMessage(message):
                 state.errorMessage = message
                 return .none
@@ -103,6 +100,48 @@ import NotificationBannerSwift
         .forEach(\.archives, action: \.grid) {
             GridFeature()
         }
+    }
+
+    private func progressPollingEffect(_ downloading: [String: PageProgress]) -> Effect<Action> {
+        guard !downloading.isEmpty else {
+            return .cancel(id: CancelID.progressPolling)
+        }
+        return .run { send in
+            var inProgress = downloading
+            while !inProgress.isEmpty {
+                for (id, progress) in inProgress {
+                    let cacheFolder = LANraragiService.cachePath!
+                        .appendingPathComponent(id, conformingTo: .folder)
+                    guard let content = try? FileManager.default.contentsOfDirectory(
+                        at: cacheFolder, includingPropertiesForKeys: []
+                    ) else {
+                        continue
+                    }
+                    let downloadedPages = Set(content.compactMap { url -> Int? in
+                        guard !url.hasDirectoryPath,
+                              let pageNumber = Int(url.deletingPathExtension().lastPathComponent),
+                              pageNumber > 0,
+                              pageNumber <= progress.total else {
+                            return nil
+                        }
+                        return pageNumber
+                    }).count
+                    if downloadedPages >= progress.total {
+                        inProgress.removeValue(forKey: id)
+                        _ = try? database.updateCached(id)
+                        await send(.removeItemFromDownloading(id))
+                    } else if downloadedPages != progress.current {
+                        inProgress[id]?.current = downloadedPages
+                        await send(.updateProgressInDownloading(id, downloadedPages))
+                    }
+                }
+                guard !inProgress.isEmpty else {
+                    return
+                }
+                try await clock.sleep(for: .seconds(2))
+            }
+        }
+        .cancellable(id: CancelID.progressPolling, cancelInFlight: true)
     }
 }
 
@@ -122,28 +161,22 @@ struct CacheView: View {
                     store.scope(\.archives, action: \.grid),
                     id: \.state.id
                 ) { gridStore in
-                    let inProgress = store.downloading.contains { (key, _) in
-                        key == gridStore.id
-                    }
+                    let inProgress = store.downloading[gridStore.id] != nil
                     grid(gridStore: gridStore, inProgress: inProgress)
                 }
             }
             .padding(.horizontal)
-            if store.showLoading {
-                ProgressView("loading")
-            }
         }
         .task {
-            store.send(.load)
+            await store.send(.load).finish()
         }
         .onChange(of: store.errorMessage) {
             if !store.errorMessage.isEmpty {
-                let banner = NotificationBanner(
+                showNotificationBanner(
                     title: String(localized: "error"),
                     subtitle: store.errorMessage,
                     style: .danger
                 )
-                banner.show()
                 store.send(.setErrorMessage(""))
             }
         }
@@ -191,7 +224,9 @@ struct CacheView: View {
         inProgress: Bool
     ) -> some View {
         let progress = if let progressItem = store.downloading[gridStore.state.id] {
-            Double(progressItem.current) / Double(progressItem.total)
+            progressItem.total > 0
+                ? Double(progressItem.current) / Double(progressItem.total)
+                : 0
         } else {
             0.0
         }
@@ -216,10 +251,24 @@ struct CacheView: View {
                 : nil
             }
             .contextMenu {
-                contextMenu(gridStore: gridStore, inProgress: inProgress)
+                if !store.isSelecting {
+                    contextMenu(gridStore: gridStore, inProgress: inProgress)
+                }
             }
+            .overlay(alignment: .topTrailing) {
+                if store.isSelecting {
+                    Image(systemName: store.selected.contains(gridStore.id) ? "checkmark.circle.fill" : "circle")
+                        .font(.largeTitle)
+                        .foregroundStyle(.white, Color.accentColor)
+                        .padding(8)
+                        .accessibilityHidden(true)
+                }
+            }
+            .accessibilityAddTraits(store.selected.contains(gridStore.id) ? [.isSelected, .isButton] : .isButton)
             .onTapGesture {
-                if !inProgress {
+                if store.isSelecting {
+                    store.send(.toggleSelection(gridStore.id))
+                } else if !inProgress {
                     openReader(gridStore: gridStore)
                 }
             }
