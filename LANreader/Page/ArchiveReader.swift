@@ -958,7 +958,7 @@ public struct ChapterMutationTarget: Equatable, Sendable {
                     }
                     .cancellable(id: CancelId.updateProgress, cancelInFlight: true)
                 }
-                return .run(priority: .background) { [state] _ in
+                let progressEffect: Effect<Action> = .run(priority: .background) { [state] _ in
                     try await clock.sleep(for: .seconds(0.5))
                     if state.serverProgress {
                         if isTank {
@@ -971,13 +971,17 @@ public struct ChapterMutationTarget: Equatable, Sendable {
                             ).value
                         }
                     }
-                    if shouldClearNewFlag {
-                        _ = try await service.clearNewFlag(id: state.currentArchiveId).value
-                    }
                 } catch: { [state] error, _ in
                     logger.error("failed to update archive progress. id=\(state.currentArchiveId) \(error)")
                 }
                 .cancellable(id: CancelId.updateProgress, cancelInFlight: true)
+                guard shouldClearNewFlag else { return progressEffect }
+                return .merge(
+                    progressEffect,
+                    .run(priority: .background) { [id = state.currentArchiveId] _ in
+                        _ = await service.clearNewFlag(id: id)
+                    }
+                )
             case let .chapterSelected(pageNumber):
                 guard let pageIndex = state.pages.firstIndex(where: { $0.pageNumber == pageNumber }) else {
                     return .none
@@ -1362,31 +1366,30 @@ public struct ChapterMutationTarget: Equatable, Sendable {
                 return .none
             case .downloadPages:
                 return .run { [state] send in
-                    var requested: [String] = []
-                    for page in state.pages where !requested.contains(where: { requestedId in
-                        requestedId == page.pageId
-                    }) {
-                        await service.backgroupFetchArchivePage(
-                            page: page.pageId,
-                            archiveId: state.currentArchiveId,
-                            pageNumber: page.pageNumber
-                        )
-                        requested.append(page.pageId)
-                    }
+                    var pageNumbers = Set<Int>()
+                    let pages = state.pages.filter { pageNumbers.insert($0.pageNumber).inserted }
+                        .sorted { $0.pageNumber < $1.pageNumber }
+                        .map {
+                            ReaderExtractedPage(
+                                archiveId: $0.sourceArchiveId, path: $0.pageId,
+                                archivePageNumber: $0.sourcePageNumber
+                            )
+                        }
                     guard let currentArchive = state.allArchives[id: state.currentArchiveId] else { return }
                     let archive = currentArchive.wrappedValue
                     var cache = ArchiveCache(
                         id: state.currentArchiveId,
                         title: archive.name,
                         tags: archive.tags,
-                        thumbnail: Data(),
+                        thumbnail: (try? database.readArchiveThumbnail(state.currentArchiveId))?.thumbnail,
                         cached: false,
-                        totalPages: requested.count,
+                        totalPages: pages.count,
                         toc: archive.toc,
                         lastUpdate: Date(),
                         progress: archive.progress
                     )
                     try database.saveCache(&cache)
+                    try await service.cachePages(archiveId: state.currentArchiveId, pages: pages)
                     await send(.finishDownloadPages)
                 } catch: { error, send in
                     logger.error("failed to cache archive \(error)")

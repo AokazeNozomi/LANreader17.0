@@ -33,18 +33,8 @@ import SwiftUI
                 state.showLoading = loading
                 return .run { send in
                     let categories = try await service.retrieveCategories().value
-                    let items = categories
-                        .map { item in
-                            item.toCategoryItem()
-                        }
-                        .enumerated()
-                        .sorted { first, second in
-                            if first.element.pinned == second.element.pinned {
-                                return first.offset < second.offset
-                            }
-                            return first.element.pinned == "1"
-                        }
-                        .map { $0.element }
+                    let items = categories.map { $0.toCategoryItem() }
+                        .sorted { $0.pinned == "1" && $1.pinned != "1" }
                     await send(.populateCategory(items))
                 } catch: { error, send in
                     logger.error("failed to load category. \(error)")
@@ -58,6 +48,9 @@ import SwiftUI
                 return .none
             case let .setErrorMessage(message):
                 state.errorMessage = message
+                if !message.isEmpty {
+                    state.showLoading = false
+                }
                 return .none
             case .binding:
                 return .none
