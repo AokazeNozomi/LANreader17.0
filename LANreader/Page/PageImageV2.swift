@@ -29,6 +29,7 @@ import Logging
         var stampsLoaded = false
         /// Aspect ratio (height / width) of the source image, measured from the image header.
         var imageAspectRatio: Double?
+        var storedImageURL: URL?
 
         public var id: String {
             "\(pageId)-\(suffix)"
@@ -159,8 +160,12 @@ import Logging
                 state.imageLoaded = false
 
                 if force {
+                    if state.pageMode.isSplitMode {
+                        state.pendingSplitMode = state.pageMode
+                    }
                     state.pageMode = .loading
                     state.imageAspectRatio = nil
+                    state.storedImageURL = nil
                 } else if state.pageMode == .loading {
                     let normalPath = imageService.storedImagePath(
                         folderUrl: state.folder,
@@ -168,6 +173,7 @@ import Logging
                     )
 
                     if let normalPath {
+                        state.storedImageURL = normalPath
                         let shouldDisplayAsSplitPages = state.splitImage
                             && imageService.shouldSplitWideImage(imageUrl: normalPath)
                         state.imageAspectRatio = imageService.imageAspectRatio(imageUrl: normalPath)
@@ -291,6 +297,7 @@ import Logging
                 state.imageLoaded = true
                 state.errorMessage = message
                 state.pendingSplitMode = nil
+                state.storedImageURL = nil
                 return .none
             case .storedImageResolved:
                 return .none
@@ -308,8 +315,14 @@ import Logging
         state.progress = 0
         state.loading = false
         state.imageLoaded = true
-        if state.imageAspectRatio == nil {
-            state.imageAspectRatio = storedImageAspectRatio(state: state)
+        if state.storedImageURL == nil {
+            state.storedImageURL = imageService.storedImagePath(
+                folderUrl: state.folder,
+                pageNumber: String(state.pageNumber)
+            )
+        }
+        if state.imageAspectRatio == nil, let storedImageURL = state.storedImageURL {
+            state.imageAspectRatio = imageService.imageAspectRatio(imageUrl: storedImageURL)
         }
 
         if shouldDisplayAsSplitPages {
@@ -319,17 +332,6 @@ import Logging
         state.pageMode = .normal
         state.pendingSplitMode = nil
         return .send(.storedImageResolved(shouldDisplayAsSplitPages: false))
-    }
-
-    /// Header-only read of the stored file, so the reader knows the page height without decoding it.
-    private func storedImageAspectRatio(state: State) -> Double? {
-        guard let imageUrl = imageService.storedImagePath(
-            folderUrl: state.folder,
-            pageNumber: String(state.pageNumber)
-        ) else {
-            return nil
-        }
-        return imageService.imageAspectRatio(imageUrl: imageUrl)
     }
 }
 

@@ -3,6 +3,7 @@ import ComposableArchitecture
 import GRDB
 import OHHTTPStubs
 import OHHTTPStubsSwift
+import os
 @testable import LANreader
 
 // swiftlint:disable type_body_length file_length
@@ -204,6 +205,34 @@ final class ArchiveReaderFeatureTests: XCTestCase {
         ))
         XCTAssertTrue(store.state.showStamps)
         XCTAssertNil(store.state.stampCreationTarget)
+    }
+
+    @MainActor
+    func testOpeningReaderWithUnknownCapabilitiesDoesNotCheckServerVersion() async throws {
+        configureReaderDefaults()
+        UserDefaults.standard.set("https://localhost", forKey: SettingsKey.lanraragiUrl)
+        UserDefaults.standard.set("apiKey", forKey: SettingsKey.lanraragiApiKey)
+        let infoRequests = OSAllocatedUnfairLock(initialState: 0)
+        stub(condition: isHost("localhost") && isPath("/api/info")) { @Sendable _ in
+            infoRequests.withLock { $0 += 1 }
+            return HTTPStubsResponse(error: URLError(.timedOut))
+        }
+        stubExtractArchive(archiveId: "archive", pages: ["./api/archives/archive/page?path=1.jpg"])
+        let service = LANraragiService(backgroundSessionConfiguration: .ephemeral)
+        let database = try makeInMemoryDatabase()
+        let store = makeTestStore(initialState: makeState()) {
+            $0.lanraragiService = service
+            $0.appDatabase = database
+        }
+        store.exhaustivity = .off
+
+        await store.send(.extractArchive)
+        await store.receive(.stampsSupportResolved(nil))
+        await store.receive(.chapterMutationSupportResolved(nil))
+        await store.receive(\.finishExtracting)
+
+        XCTAssertEqual(infoRequests.withLock { $0 }, 0)
+        XCTAssertTrue(store.state.canUseStamps)
     }
 
     @MainActor
@@ -2809,6 +2838,169 @@ final class ArchiveReaderFeatureTests: XCTestCase {
     }
 
     @MainActor
+    func testReloadingTrailingSplitHalfKeepsItsHalf() async throws {
+        try await assertReloadKeepsTrailingSplitHalf(priorityLeft: false)
+    }
+
+    @MainActor
+    func testReloadingTrailingSplitHalfKeepsItsHalfWithPriorityLeft() async throws {
+        try await assertReloadKeepsTrailingSplitHalf(priorityLeft: true)
+    }
+
+    @MainActor
+    func testFailedReloadOfSplitHalfRestoresSibling() async throws {
+        try await configureVerifiedClient()
+        configureReaderDefaults(splitWideImage: true)
+        let archiveId = "reload-split-failure"
+        stubReaderPageFailure(path: "/1")
+        let fixture = makeLoadedSplitPageFixture(archiveId: archiveId, priorityLeft: false)
+        let store = makeTestStore(initialState: fixture.state)
+        store.exhaustivity = .off
+
+        await store.send(.page(.element(id: fixture.trailingId, action: .load(true)))) {
+            $0.pages[id: fixture.leadingId]?.imageLoaded = false
+        }
+        await store.receive(\.page[id: fixture.trailingId].setError)
+
+        XCTAssertEqual(store.state.pages.map(\.id), [fixture.leadingId, fixture.trailingId])
+        XCTAssertEqual(store.state.pages[id: fixture.leadingId]?.imageLoaded, true)
+    }
+
+    @MainActor
+    func testReloadingSplitHalfThatIsNoLongerWideCollapsesToOnePage() async throws {
+        try await configureVerifiedClient()
+        configureReaderDefaults(splitWideImage: true)
+        let archiveId = "reload-split-narrow"
+        let folder = try XCTUnwrap(LANraragiService.downloadPath)
+            .appendingPathComponent(archiveId, conformingTo: .folder)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        stubReaderPage(path: "/1", data: makeReaderPageData(size: CGSize(width: 100, height: 200)))
+        let fixture = makeLoadedSplitPageFixture(archiveId: archiveId, priorityLeft: false)
+        let store = makeTestStore(initialState: fixture.state)
+        store.exhaustivity = .off
+
+        await store.send(.page(.element(id: fixture.trailingId, action: .load(true))))
+        await store.receive(\.page[id: fixture.trailingId].storedImageResolved)
+
+        XCTAssertEqual(store.state.pages.map(\.id), [fixture.leadingId])
+        XCTAssertEqual(store.state.pages.map(\.pageMode), [.normal])
+        XCTAssertEqual(store.state.currentPageIndex, 0)
+    }
+
+    @MainActor
+    private func assertReloadKeepsTrailingSplitHalf(
+        priorityLeft: Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        try await configureVerifiedClient()
+        configureReaderDefaults(splitWideImage: true, splitPiorityLeft: priorityLeft)
+        let archiveId = "reload-split-\(priorityLeft ? "left" : "right")"
+        let folder = try XCTUnwrap(LANraragiService.downloadPath)
+            .appendingPathComponent(archiveId, conformingTo: .folder)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        stubReaderPage(path: "/1", data: makeReaderPageData())
+        let fixture = makeLoadedSplitPageFixture(archiveId: archiveId, priorityLeft: priorityLeft)
+        let leadingMode = PageMode.preferredSplitMode(priorityLeft: priorityLeft)
+        let trailingMode = PageMode.trailingSplitMode(priorityLeft: priorityLeft)
+        let store = makeTestStore(initialState: fixture.state)
+        store.exhaustivity = .off
+
+        await store.send(.page(.element(id: fixture.trailingId, action: .load(true)))) {
+            $0.pages[id: fixture.trailingId]?.pageMode = .loading
+            $0.pages[id: fixture.trailingId]?.pendingSplitMode = trailingMode
+            $0.pages[id: fixture.leadingId]?.imageLoaded = false
+        }
+        await store.receive(\.page[id: fixture.trailingId].storedImageResolved)
+
+        XCTAssertEqual(
+            store.state.pages.map(\.id),
+            [fixture.leadingId, fixture.trailingId],
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            store.state.pages.map(\.pageMode),
+            [leadingMode, trailingMode],
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(store.state.pages.map(\.imageLoaded), [true, true], file: file, line: line)
+        XCTAssertEqual(store.state.currentPageIndex, 1, file: file, line: line)
+    }
+
+    @MainActor
+    func testLoadingStoredPageKeepsItsURLAndForcedReloadClearsIt() async throws {
+        let state = PageFeature.State(archiveId: UUID().uuidString, pageId: "/stored-url", pageNumber: 1, cached: true)
+        let folder = try XCTUnwrap(state.folder)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let pageURL = folder.appendingPathComponent("1.jpg")
+        try makeReaderPageData().write(to: pageURL)
+        let store = TestStore(initialState: state) { PageFeature() }
+        store.exhaustivity = .off
+
+        await store.send(.load(false))
+        await store.receive(\.storedImageResolved)
+        XCTAssertEqual(store.state.storedImageURL?.standardizedFileURL, pageURL.standardizedFileURL)
+        XCTAssertNotNil(store.state.imageAspectRatio)
+
+        await store.send(.load(true)) {
+            $0.storedImageURL = nil
+        }
+        await store.receive(\.setError)
+        XCTAssertNil(store.state.storedImageURL)
+    }
+
+    @MainActor
+    func testPageCellRendersFromStoredURLAndShowsErrorsOnConfigure() throws {
+        let imageURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("stored-url-\(UUID().uuidString).jpg")
+        let good = makeReaderPageData()
+        try good.write(to: imageURL)
+        defer { try? FileManager.default.removeItem(at: imageURL) }
+        var loaded = PageFeature.State(archiveId: UUID().uuidString, pageId: "/cell-url", pageNumber: 1)
+        loaded.pageMode = .normal
+        loaded.imageLoaded = true
+        loaded.storedImageURL = imageURL
+        let cell = UIPageCell(frame: CGRect(x: 0, y: 0, width: 320, height: 480))
+        cell.configure(with: Store(initialState: loaded) { PageFeature() }, fitPageWidth: false,
+                       showsStamps: false, onCreateStamp: { _ in }, onEditStamp: { _ in })
+
+        let rendered = visibleSubviews(of: UIImageView.self, in: cell).compactMap(\.image).last
+        XCTAssertEqual(rendered?.isSymbolImage, false)
+        XCTAssertEqual(rendered?.cgImage?.width, UIImage(data: good)?.cgImage?.width)
+
+        var failed = PageFeature.State(archiveId: UUID().uuidString, pageId: "/cell-error", pageNumber: 1)
+        failed.imageLoaded = true
+        failed.errorMessage = "Page failed"
+        cell.configure(with: Store(initialState: failed) { PageFeature() }, fitPageWidth: false,
+                       showsStamps: false, onCreateStamp: { _ in }, onEditStamp: { _ in })
+
+        XCTAssertTrue(visibleSubviews(of: UILabel.self, in: cell).contains { $0.text == "Page failed" })
+    }
+
+    @MainActor
+    func testSplitPageResolutionCopiesStoredURLToInsertedSibling() async {
+        configureReaderDefaults(splitWideImage: true)
+        var initialState = makeState(progress: 1)
+        initialState.$splitImage = SharedReader(value: true)
+        initialState.pages = makePageStates(count: 2)
+        let storedURL = URL(fileURLWithPath: "/tmp/archive/1.jpg")
+        initialState.pages[0].storedImageURL = storedURL
+        initialState.currentPageIndex = 0
+        let store = makeTestStore(initialState: initialState)
+        store.exhaustivity = .off
+
+        await store.send(.page(.element(
+            id: initialState.pages[0].id,
+            action: .storedImageResolved(shouldDisplayAsSplitPages: true)
+        )))
+
+        XCTAssertEqual(store.state.pages.map(\.storedImageURL), [storedURL, storedURL, nil])
+    }
+
+    @MainActor
     func testSplitPageResolutionBeforeCurrentPreservesVisiblePage() async {
         configureReaderDefaults(splitWideImage: true)
         var initialState = makeState(progress: 3)
@@ -4872,6 +5064,74 @@ private func makePageStates(
         }
     }
     return IdentifiedArray(uniqueElements: pageStates)
+}
+
+private struct LoadedSplitPageFixture {
+    let state: ArchiveReaderFeature.State
+    let leadingId: PageFeature.State.ID
+    let trailingId: PageFeature.State.ID
+}
+
+/// Mirrors a split page after resolution: the original item keeps its normal identity and shows
+/// the leading half, and the inserted sibling shows the trailing half and is the current page.
+@MainActor
+private func makeLoadedSplitPageFixture(
+    archiveId: String,
+    priorityLeft: Bool
+) -> LoadedSplitPageFixture {
+    var state = makeState(archiveId: archiveId, progress: 1)
+    state.$splitImage = SharedReader(value: true)
+    state.$piorityLeft = SharedReader(value: priorityLeft)
+    var leading = loadedPageState(archiveId: archiveId, pageId: "1", pageNumber: 1, pageMode: .normal)
+    leading.pageMode = PageMode.preferredSplitMode(priorityLeft: priorityLeft)
+    leading.$splitImage = SharedReader(value: true)
+    var trailing = loadedPageState(
+        archiveId: archiveId,
+        pageId: "1",
+        pageNumber: 1,
+        pageMode: PageMode.trailingSplitMode(priorityLeft: priorityLeft)
+    )
+    trailing.$splitImage = SharedReader(value: true)
+    state.pages = IdentifiedArray(uniqueElements: [leading, trailing])
+    state.currentPageIndex = 1
+    return LoadedSplitPageFixture(state: state, leadingId: leading.id, trailingId: trailing.id)
+}
+
+private func stubReaderPage(path: String, data: Data) {
+    stub(condition: isHost("localhost") && isPath(path) && isMethodGET()) { _ in
+        HTTPStubsResponse(data: data, statusCode: 200, headers: ["Content-Type": "image/png"])
+    }
+}
+
+private func stubReaderPageFailure(path: String) {
+    stub(condition: isHost("localhost") && isPath(path) && isMethodGET()) { _ in
+        HTTPStubsResponse(data: Data(), statusCode: 500, headers: nil)
+    }
+}
+
+@MainActor
+private func visibleSubviews<View: UIView>(of type: View.Type, in root: UIView) -> [View] {
+    var views = [root]
+    var matches = [View]()
+    while let view = views.popLast() {
+        guard !view.isHidden else { continue }
+        views.append(contentsOf: view.subviews)
+        if let match = view as? View {
+            matches.append(match)
+        }
+    }
+    return matches
+}
+
+private func makeReaderPageData(size: CGSize = CGSize(width: 200, height: 100)) -> Data {
+    let format = UIGraphicsImageRendererFormat.default()
+    format.opaque = true
+    format.scale = 1
+    let image = UIGraphicsImageRenderer(size: size, format: format).image { context in
+        UIColor.systemBlue.setFill()
+        context.fill(CGRect(origin: .zero, size: size))
+    }
+    return image.pngData()!
 }
 
 private func makeSplitPageStates(

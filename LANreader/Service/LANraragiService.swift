@@ -10,7 +10,7 @@ import os
 
 actor LANraragiService {
     public static let downloadPath = try? FileManager.default.url(
-        for: .documentDirectory,
+        for: .cachesDirectory,
         in: .userDomainMask,
         appropriateFor: nil,
         create: true
@@ -20,7 +20,7 @@ actor LANraragiService {
     public static let cachePath = try? FileManager.default.url(
         for: .documentDirectory,
         in: .userDomainMask,
-        appropriateFor: .picturesDirectory,
+        appropriateFor: nil,
         create: true
     )
     .appendingPathComponent("cached", conformingTo: .folder)
@@ -113,20 +113,6 @@ actor LANraragiService {
         } catch {
             Self.logger.warning("Failed to check server version at startup: \(error.localizedDescription)")
         }
-    }
-
-    func stampSupportForCurrentServer() async -> Bool? {
-        if supportsStamps == nil {
-            await checkServerVersionAtStartup()
-        }
-        return supportsStamps
-    }
-
-    func chapterMutationSupportForCurrentServer() async -> Bool? {
-        if supportsChapterMutations == nil {
-            await checkServerVersionAtStartup()
-        }
-        return supportsChapterMutations
     }
 
     func updateServerCapabilities(serverVersion: String) {
@@ -613,6 +599,8 @@ extension LANraragiService {
         defer { queuingCacheIDs.remove(archiveId) }
         let tasks = await getURLSession().allTasks
         try Task.checkCancellation()
+        guard queuingCacheIDs.contains(archiveId) else { return }
+        urlSessionDelegate?.resumeDownloads(archiveId: archiveId)
         let activePages = Set(tasks.compactMap { task -> Int? in
             guard task.state != .completed,
                   task.originalRequest?.value(forHTTPHeaderField: "X-Archive-Id") == archiveId else { return nil }
@@ -625,6 +613,19 @@ extension LANraragiService {
             && !activePages.contains(index + 1) {
             try Task.checkCancellation()
             backgroupFetchArchivePage(page: page.path, archiveId: archiveId, pageNumber: index + 1)
+        }
+    }
+
+    func removeCachedPages(archiveId: String) async {
+        queuingCacheIDs.remove(archiveId)
+        let session = getURLSession()
+        urlSessionDelegate?.discardDownloads(archiveId: archiveId)
+        for task in await session.allTasks
+        where task.originalRequest?.value(forHTTPHeaderField: "X-Archive-Id") == archiveId {
+            task.cancel()
+        }
+        if let folder = Self.cachePath?.appendingPathComponent(archiveId, conformingTo: .folder) {
+            try? FileManager.default.removeItem(at: folder)
         }
     }
 
@@ -655,6 +656,7 @@ final class AuthInterceptor: RequestInterceptor, Sendable {
 final class URLSessionDelegateHandler: NSObject, URLSessionDelegate, URLSessionDownloadDelegate, Sendable {
     private let imageService: ImageService
     private let activeRequests = OSAllocatedUnfairLock(initialState: [Int: URLRequest]())
+    private let discardedArchiveIDs = OSAllocatedUnfairLock(initialState: Set<String>())
     private let logger = Logger(label: "CacheDownload")
 
     init(imageService: ImageService) {
@@ -681,6 +683,14 @@ final class URLSessionDelegateHandler: NSObject, URLSessionDelegate, URLSessionD
         }
     }
 
+    func discardDownloads(archiveId: String) {
+        discardedArchiveIDs.withLock { _ = $0.insert(archiveId) }
+    }
+
+    func resumeDownloads(archiveId: String) {
+        discardedArchiveIDs.withLock { _ = $0.remove(archiveId) }
+    }
+
     func urlSession(_: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         activeRequests.withLock { _ = $0.removeValue(forKey: task.taskIdentifier) }
         if let error {
@@ -698,6 +708,7 @@ final class URLSessionDelegateHandler: NSObject, URLSessionDelegate, URLSessionD
 
         if let archiveId = task.originalRequest?.value(forHTTPHeaderField: "X-Archive-Id"),
            let pageNumber = task.originalRequest?.value(forHTTPHeaderField: "X-Page-Number"),
+           !discardedArchiveIDs.withLock({ $0.contains(archiveId) }),
            let cachePath = LANraragiService.cachePath {
             let folder = cachePath.appendingPathComponent(archiveId, conformingTo: .folder)
             let stored = imageService.storePageImage(

@@ -133,11 +133,9 @@ import ComposableArchitecture
                 state.downloading.removeValue(forKey: id)
                 state.failedDownloads.remove(id)
                 state.retryingDownloads.remove(id)
-                let cacheFolder = LANraragiService.cachePath!
-                    .appendingPathComponent(id, conformingTo: .folder)
-                try? FileManager.default.removeItem(at: cacheFolder)
                 return .merge(
                     .cancel(id: CancelID.retry(id)),
+                    .run { _ in await service.removeCachedPages(archiveId: id) },
                     progressPollingEffect(state.downloading.filter {
                         !state.failedDownloads.contains($0.key) && !state.retryingDownloads.contains($0.key)
                     })
@@ -165,7 +163,7 @@ import ComposableArchitecture
                 for (id, progress) in inProgress {
                     let cacheFolder = LANraragiService.cachePath!
                         .appendingPathComponent(id, conformingTo: .folder)
-                    let downloadedPages = imageService.validStoredPageNumbers(
+                    let downloadedPages = imageService.storedPageNumbers(
                         folderUrl: cacheFolder, totalPages: progress.total
                     ).count
                     if downloadedPages == progress.total && progress.total > 0 {
