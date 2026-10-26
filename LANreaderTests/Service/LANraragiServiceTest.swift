@@ -59,6 +59,26 @@ class LANraragiServiceTest: XCTestCase {
         XCTAssertNil(actual)
     }
 
+    func testStampSupportStartsWithServerVersionZeroNineEighty() async {
+        await service.updateServerCapabilities(serverVersion: "0.9.79")
+        let unsupported = await service.supportsStamps
+        XCTAssertEqual(unsupported, false)
+
+        await service.updateServerCapabilities(serverVersion: "0.9.80")
+        let supported = await service.supportsStamps
+        XCTAssertEqual(supported, true)
+    }
+
+    func testChapterMutationSupportStartsWithServerVersionZeroNineSeventy() async {
+        await service.updateServerCapabilities(serverVersion: "0.9.69")
+        let unsupported = await service.supportsChapterMutations
+        XCTAssertEqual(unsupported, false)
+
+        await service.updateServerCapabilities(serverVersion: "0.9.70")
+        let supported = await service.supportsChapterMutations
+        XCTAssertEqual(supported, true)
+    }
+
     func testRetrieveArchiveIndex() async throws {
         try await configureVerifiedClient()
 
@@ -116,6 +136,181 @@ class LANraragiServiceTest: XCTestCase {
         XCTAssertEqual(actual[0].isnew, "false")
         XCTAssertEqual(actual[0].tags, nil)
         XCTAssertEqual(actual[0].title, "title")
+    }
+
+    func testRetrieveStampsUsesOneBasedPagePath() async throws {
+        try await configureVerifiedClient()
+
+        let response = Data("""
+        {
+          "result": [
+            {
+              "id": "STAMPS_3_1777224824662",
+              "position": "12.5,34",
+              "content": "Translation note"
+            }
+          ]
+        }
+        """.utf8)
+        stub(condition: isHost("localhost")
+                && isPath("/api/archives/\(archiveId)/stamps/3")
+                && isMethodGET()
+                && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")) { _ in
+            HTTPStubsResponse(data: response, statusCode: 200, headers: ["Content-Type": "application/json"])
+        }
+
+        let actual = try await service.retrieveStamps(id: archiveId, page: 3).value
+
+        XCTAssertEqual(
+            actual.result,
+            [
+                ArchiveStamp(
+                    id: "STAMPS_3_1777224824662",
+                    position: "12.5,34",
+                    content: "Translation note"
+                )
+            ]
+        )
+    }
+
+    func testAddStampUsesPutQueryContract() async throws {
+        try await configureVerifiedClient()
+
+        let response = Data("""
+        {
+          "operation": "add_stamp",
+          "stamp_id": "STAMPS_3_1777224824662",
+          "success": 1
+        }
+        """.utf8)
+        stub(condition: isHost("localhost")
+                && isPath("/api/archives/\(archiveId)/stamps/3")
+                && containsQueryParams([
+                    "content": "Translation note",
+                    "position": "12.5,34.0"
+                ])
+                && isMethodPUT()
+                && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")
+                && { $0.ohhttpStubs_httpBody == nil }) { _ in
+            HTTPStubsResponse(data: response, statusCode: 200, headers: ["Content-Type": "application/json"])
+        }
+
+        let actual = try await service.addStamp(
+            id: archiveId,
+            page: 3,
+            content: "Translation note",
+            position: "12.5,34.0"
+        ).value
+
+        XCTAssertEqual(
+            actual,
+            AddStampResponse(
+                stampId: "STAMPS_3_1777224824662",
+                success: 1
+            )
+        )
+    }
+
+    func testAddArchiveChapterUsesPutQueryContract() async throws {
+        try await configureVerifiedClient()
+
+        stub(condition: isHost("localhost")
+                && isPath("/api/archives/\(archiveId)/toc")
+                && containsQueryParams([
+                    "page": "3",
+                    "title": "Chapter & notes"
+                ])
+                && isMethodPUT()
+                && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")
+                && { $0.ohhttpStubs_httpBody == nil }) { _ in
+            HTTPStubsResponse(
+                data: Data("{\"operation\":\"update_toc\",\"success\":1}".utf8),
+                statusCode: 200,
+                headers: ["Content-Type": "application/json"]
+            )
+        }
+
+        let actual = try await service.addArchiveChapter(
+            id: archiveId,
+            page: 3,
+            title: "Chapter & notes"
+        ).value
+
+        XCTAssertEqual(actual.success, 1)
+    }
+
+    func testDeleteArchiveChapterUsesDeleteQueryContract() async throws {
+        try await configureVerifiedClient()
+
+        stub(condition: isHost("localhost")
+                && isPath("/api/archives/\(archiveId)/toc")
+                && containsQueryParams(["page": "3"])
+                && isMethodDELETE()
+                && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")
+                && { $0.ohhttpStubs_httpBody == nil }) { _ in
+            HTTPStubsResponse(
+                data: Data("{\"operation\":\"remove_toc\",\"success\":1}".utf8),
+                statusCode: 200,
+                headers: ["Content-Type": "application/json"]
+            )
+        }
+
+        let actual = try await service.deleteArchiveChapter(id: archiveId, page: 3).value
+
+        XCTAssertEqual(actual.success, 1)
+    }
+
+    func testUpdateStampUsesPutQueryContract() async throws {
+        try await configureVerifiedClient()
+
+        let stampId = "STAMPS_3_1777224824662"
+        stub(condition: isHost("localhost")
+                && isPath("/api/stamps/\(stampId)")
+                && containsQueryParams(["content": "Updated note & detail"])
+                && isMethodPUT()
+                && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")
+                && { $0.ohhttpStubs_httpBody == nil }) { _ in
+            HTTPStubsResponse(
+                data: Data("""
+                {
+                  "operation": "update_stamp",
+                  "success": 1
+                }
+                """.utf8),
+                statusCode: 200,
+                headers: ["Content-Type": "application/json"]
+            )
+        }
+
+        let actual = try await service.updateStamp(id: stampId, content: "Updated note & detail").value
+
+        XCTAssertEqual(actual.success, 1)
+    }
+
+    func testDeleteStampUsesDeleteContract() async throws {
+        try await configureVerifiedClient()
+
+        let stampId = "STAMPS_3_1777224824662"
+        stub(condition: isHost("localhost")
+                && isPath("/api/stamps/\(stampId)")
+                && isMethodDELETE()
+                && hasHeaderNamed("Authorization", value: "Bearer YXBpS2V5")
+                && { $0.ohhttpStubs_httpBody == nil }) { _ in
+            HTTPStubsResponse(
+                data: Data("""
+                {
+                  "operation": "delete_stamp",
+                  "success": 1
+                }
+                """.utf8),
+                statusCode: 200,
+                headers: ["Content-Type": "application/json"]
+            )
+        }
+
+        let actual = try await service.deleteStamp(id: stampId).value
+
+        XCTAssertEqual(actual.success, 1)
     }
 
     func testRetrieveArchiveThumbnailReturnsImageData() async throws {
@@ -414,6 +609,51 @@ class LANraragiServiceTest: XCTestCase {
 
         XCTAssertEqual(tank.id, tankId)
         XCTAssertEqual(tank.archives, [archiveId])
+    }
+
+    func testCreateTankoubonWithOrderedArchives() async throws {
+        try await configureVerifiedClient()
+
+        let tankId = self.tankId
+        let archives = [archiveId, String(archiveId.reversed())]
+        stub(condition: isHost("localhost")
+                && isPath("/api/tankoubons")
+                && isMethodPUT()) { request in
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer YXBpS2V5")
+            XCTAssertTrue(request.value(forHTTPHeaderField: "Content-Type")?.hasPrefix(
+                "application/x-www-form-urlencoded"
+            ) == true)
+            let body = request.ohhttpStubs_httpBody.flatMap { String(data: $0, encoding: .utf8) }
+            let name = URLComponents(string: "?\(body ?? "")")?.queryItems?.first { $0.name == "name" }?.value
+            XCTAssertEqual(name, "New Tank")
+            return HTTPStubsResponse(
+                data: Data("{\"operation\":\"create_tankoubon\",\"tankoubon_id\":\"\(tankId)\",\"success\":1}".utf8),
+                statusCode: 200,
+                headers: ["Content-Type": "application/json"]
+            )
+        }
+        stub(condition: isHost("localhost")
+                && isPath("/api/tankoubons/\(tankId)")
+                && isMethodPUT()) { request in
+            let body = request.ohhttpStubs_httpBody.flatMap {
+                try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+            }
+            XCTAssertEqual(body?["archives"] as? [String], archives)
+            XCTAssertNil(body?["metadata"])
+            return HTTPStubsResponse(
+                data: Data("{\"success\":1}".utf8),
+                statusCode: 200,
+                headers: ["Content-Type": "application/json"]
+            )
+        }
+
+        let created = try await service.createTankoubon(name: "New Tank").value
+        let updated = try await service.updateTankoubon(
+            id: try XCTUnwrap(created.tankoubonId), archives: archives
+        ).value
+
+        XCTAssertEqual(created.success, 1)
+        XCTAssertEqual(updated.success, 1)
     }
 
     func testRetrieveFullTankoubonAndThumbnail() async throws {

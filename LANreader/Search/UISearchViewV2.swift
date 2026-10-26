@@ -11,11 +11,18 @@ import UIKit
         var keyword = ""
         var suggestedTag = [TagWithType]()
         var popularTag = [TagWithType]()
+        var recentSearches = [String]()
         var archiveList = ArchiveListFeature.State(
             filter: SearchFilter(category: nil, filter: nil),
             loadOnAppear: false,
             currentTab: .search
         )
+
+        var showsRecentSearches: Bool {
+            archiveList.filter.category == nil
+                && archiveList.filter.filter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
+                && !recentSearches.isEmpty
+        }
     }
 
     public enum Action: Equatable, BindableAction {
@@ -25,12 +32,17 @@ import UIKit
         case loadPopularTag
         case suggestionTapped(TagWithType)
         case searchSubmit(String)
+        case searchCleared
+        case loadRecentSearches
+        case recentSearchTapped(String)
+        case clearRecentSearches
         case archiveList(ArchiveListFeature.Action)
     }
 
     @Dependency(\.lanraragiService) var service
     @Dependency(\.appDatabase) var database
     @Dependency(\.continuousClock) var clock
+    @Dependency(\.date.now) var now
 
     enum CancelId { case search }
 
@@ -82,7 +94,34 @@ import UIKit
                     return .none
                 }
                 state.archiveList.filter = SearchFilter(category: nil, filter: keyword)
-                return .cancel(id: CancelId.search)
+                state.archiveList.selected.removeAll()
+                let historyKeyword = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !historyKeyword.isEmpty {
+                    do {
+                        try database.saveSearchHistory(keyword: historyKeyword, date: now)
+                    } catch {
+                        logger.error("failed to save search history. \(error)")
+                    }
+                }
+                return .merge(.cancel(id: CancelId.search), .send(.loadRecentSearches))
+            case .searchCleared:
+                guard state.archiveList.filter.filter != nil else { return .none }
+                state.archiveList.filter = SearchFilter(category: nil, filter: nil)
+                return .send(.archiveList(.reloadFromFirstPage))
+            case .loadRecentSearches:
+                state.recentSearches = (try? database.recentSearches()) ?? []
+                return .none
+            case let .recentSearchTapped(keyword):
+                state.keyword = keyword
+                return .send(.searchSubmit(keyword))
+            case .clearRecentSearches:
+                do {
+                    try database.clearSearchHistory()
+                    state.recentSearches = []
+                } catch {
+                    logger.error("failed to clear search history. \(error)")
+                }
+                return .none
             case .binding:
                 return .none
             case .archiveList:
@@ -154,21 +193,17 @@ class UISearchViewV2Controller: UIViewController {
         )
     }()
 
+    private lazy var recentSearchesController = UIHostingController(
+        rootView: RecentSearchesView(store: store) { [weak self] keyword in
+            self?.runRecentSearch(keyword)
+        }
+    )
+
     // Constraints for animated height changes
     private var suggestionsHeightConstraint: NSLayoutConstraint?
     private var hasRenderedSuggestions = false
     private var isEditingSearchText = false
-
-    // Constants
-    private let maxSuggestionsHeight: CGFloat = {
-        if UIDevice.current.userInterfaceIdiom == .phone {
-            return 340
-        } else {
-            return 540
-        }
-    }()
-    private let suggestionsRowHeight: CGFloat = 58
-    private let suggestionsVerticalPadding: CGFloat = 12
+    private var isBrowsingSuggestions = false
 
     // MARK: - Init
     init(store: StoreOf<SearchFeature>) {
@@ -191,13 +226,7 @@ class UISearchViewV2Controller: UIViewController {
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        if navigationController?.viewControllers.count == 1 {
-            if #available(iOS 18.0, *) {
-                tabBarController?.setTabBarHidden(false, animated: false)
-            } else {
-                tabBarController?.tabBar.isHidden = false
-            }
-        }
+        store.send(.loadRecentSearches)
     }
 
     override func viewDidLayoutSubviews() {
@@ -206,6 +235,7 @@ class UISearchViewV2Controller: UIViewController {
             roundedRect: suggestionsContainerView.bounds,
             cornerRadius: 22
         ).cgPath
+        updateSuggestionHeight()
     }
 
     // MARK: - Setup
@@ -228,6 +258,7 @@ class UISearchViewV2Controller: UIViewController {
 
         // Child archive list
         add(archiveListViewController)
+        layoutRecentSearches()
 
         view.addSubview(suggestionsContainerView)
         suggestionsContainerView.addSubview(suggestionsBackgroundView)
@@ -238,20 +269,19 @@ class UISearchViewV2Controller: UIViewController {
 
         if UIDevice.current.userInterfaceIdiom == .phone {
             NSLayoutConstraint.activate([
-                // Archive list fills
                 archiveListViewController.view.topAnchor.constraint(equalTo: view.topAnchor),
                 archiveListViewController.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
                 archiveListViewController.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
                 archiveListViewController.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
-                // Suggestions table anchors (top under safe area so it visually appears below nav/search bar)
-                suggestionsContainerView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+                suggestionsContainerView.topAnchor.constraint(
+                    equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8
+                ),
                 suggestionsContainerView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
                 suggestionsContainerView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16)
             ])
         } else {
             NSLayoutConstraint.activate([
-                // Search bar constraints
                 searchBar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
                 searchBar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
                 searchBar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
@@ -282,6 +312,19 @@ class UISearchViewV2Controller: UIViewController {
         ])
     }
 
+    private func layoutRecentSearches() {
+        add(recentSearchesController)
+        let recentView: UIView = recentSearchesController.view
+        let listView: UIView = archiveListViewController.view
+        recentView.isHidden = true
+        NSLayoutConstraint.activate([
+            recentView.topAnchor.constraint(equalTo: listView.topAnchor),
+            recentView.leadingAnchor.constraint(equalTo: listView.leadingAnchor),
+            recentView.trailingAnchor.constraint(equalTo: listView.trailingAnchor),
+            recentView.bottomAnchor.constraint(equalTo: listView.bottomAnchor)
+        ])
+    }
+
     private func setupDelegates() {
         if UIDevice.current.userInterfaceIdiom == .phone {
             searchController.searchBar.delegate = self
@@ -303,30 +346,70 @@ class UISearchViewV2Controller: UIViewController {
 
     private func setupObserve() {
         observe { [weak self] in
-            guard let self else { return }
-            _ = store.suggestedTag
-            let isFieldEmpty = activeSearchBar.text?.isEmpty ?? true
-            guard isEditingSearchText || isFieldEmpty else {
-                hideSuggestions(animated: false)
-                return
-            }
-            suggestionsTableView.reloadData()
-            updateSuggestionsVisibility(animated: hasRenderedSuggestions)
-            hasRenderedSuggestions = true
+            self?.renderSuggestions()
         }
+
+        observe { [weak self] in
+            guard let self else { return }
+            recentSearchesController.view.isHidden = !store.showsRecentSearches
+        }
+    }
+
+    private func renderSuggestions() {
+        let selecting = store.archiveList.selectMode == .active
+        activeSearchBar.isUserInteractionEnabled = !selecting
+        if selecting {
+            activeSearchBar.resignFirstResponder()
+            searchController.isActive = false
+            isEditingSearchText = false
+            hideSuggestions(animated: false)
+            return
+        }
+        _ = store.suggestedTag
+        let showsRecentSearches = store.showsRecentSearches
+        let isFieldEmpty = activeSearchBar.text?.isEmpty ?? true
+        // Recent searches fill the empty field's space, so popular tags wait for the field to be focused.
+        guard isEditingSearchText || isBrowsingSuggestions || (isFieldEmpty && !showsRecentSearches) else {
+            hideSuggestions(animated: false)
+            return
+        }
+        suggestionsTableView.reloadData()
+        updateSuggestionsVisibility(animated: hasRenderedSuggestions)
+        hasRenderedSuggestions = true
+    }
+
+    func showSearch(keyword: String) {
+        loadViewIfNeeded()
+        activeSearchBar.text = keyword
+        isEditingSearchText = false
+        isBrowsingSuggestions = false
+        activeSearchBar.resignFirstResponder()
+        hideSuggestions(animated: false)
+    }
+
+    private func runRecentSearch(_ keyword: String) {
+        activeSearchBar.text = keyword
+        store.send(.recentSearchTapped(keyword))
+        isEditingSearchText = false
+        isBrowsingSuggestions = false
+        activeSearchBar.resignFirstResponder()
+        hideSuggestions()
     }
 
     // MARK: - Suggestions Handling
     private func updateSuggestionsVisibility(animated: Bool = true) {
         if !store.suggestedTag.isEmpty {
-            let contentHeight = CGFloat(store.suggestedTag.count) * suggestionsRowHeight + suggestionsVerticalPadding
-            let newHeight = min(contentHeight, maxSuggestionsHeight)
+            let contentHeight = Self.suggestionContentHeight(itemCount: store.suggestedTag.count)
+            let newHeight = Self.suggestionListHeight(
+                itemCount: store.suggestedTag.count,
+                availableHeight: availableSuggestionHeight
+            )
 
             let updates = {
                 self.suggestionsHeightConstraint?.constant = newHeight
                 self.suggestionsContainerView.isHidden = false
                 self.suggestionsTableView.isHidden = false
-                self.suggestionsTableView.showsVerticalScrollIndicator = contentHeight > self.maxSuggestionsHeight
+                self.suggestionsTableView.showsVerticalScrollIndicator = contentHeight > newHeight
                 self.view.layoutIfNeeded()
             }
             if animated {
@@ -339,6 +422,31 @@ class UISearchViewV2Controller: UIViewController {
         } else {
             hideSuggestions(animated: animated)
         }
+    }
+
+    private var availableSuggestionHeight: CGFloat {
+        let safeHeight = view.safeAreaLayoutGuide.layoutFrame.height
+        return safeHeight > 0 ? safeHeight : view.bounds.height
+    }
+
+    private func updateSuggestionHeight() {
+        guard !suggestionsContainerView.isHidden else { return }
+        let height = Self.suggestionListHeight(
+            itemCount: store.suggestedTag.count,
+            availableHeight: availableSuggestionHeight
+        )
+        guard suggestionsHeightConstraint?.constant != height else { return }
+        suggestionsHeightConstraint?.constant = height
+        suggestionsTableView.showsVerticalScrollIndicator =
+            Self.suggestionContentHeight(itemCount: store.suggestedTag.count) > height
+    }
+
+    static func suggestionListHeight(itemCount: Int, availableHeight: CGFloat) -> CGFloat {
+        min(suggestionContentHeight(itemCount: itemCount), max(availableHeight, 0) * 0.45, 540)
+    }
+
+    private static func suggestionContentHeight(itemCount: Int) -> CGFloat {
+        CGFloat(itemCount) * 58 + 12
     }
 
     private func hideSuggestions(animated: Bool = true) {
@@ -362,22 +470,35 @@ class UISearchViewV2Controller: UIViewController {
 extension UISearchViewV2Controller: UISearchBarDelegate {
     func searchBarTextDidBeginEditing(_ searchBar: UISearchBar) {
         isEditingSearchText = true
+        isBrowsingSuggestions = false
+        renderSuggestions()
     }
 
     func searchBarTextDidEndEditing(_ searchBar: UISearchBar) {
         isEditingSearchText = false
+        renderSuggestions()
     }
 
     func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
-        isEditingSearchText = true
+        isEditingSearchText = searchBar.isFirstResponder
         store.send(.binding(.set(\.keyword, searchText)))
+        if searchText.isEmpty {
+            store.send(.searchCleared)
+        }
         store.send(.generateSuggestion(searchText))
+    }
+
+    func searchBarCancelButtonClicked(_ searchBar: UISearchBar) {
+        isBrowsingSuggestions = false
+        store.send(.binding(.set(\.keyword, "")))
+        store.send(.searchCleared)
     }
 
     func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
         guard let text = searchBar.text, !text.isEmpty else { return }
         store.send(.binding(.set(\.keyword, text)))
         store.send(.searchSubmit(text))
+        isBrowsingSuggestions = false
         hideSuggestions()
         searchBar.resignFirstResponder()
     }
@@ -403,7 +524,14 @@ extension UISearchViewV2Controller: UITableViewDataSource, UITableViewDelegate {
         let suggestion = store.suggestedTag[indexPath.row]
         store.send(.suggestionTapped(suggestion))
         activeSearchBar.text = store.keyword
+        isBrowsingSuggestions = false
         hideSuggestions()
         tableView.deselectRow(at: indexPath, animated: true)
+    }
+
+    // Dragging the suggestions dismisses the keyboard, which must not also dismiss the suggestions.
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        guard scrollView === suggestionsTableView else { return }
+        isBrowsingSuggestions = true
     }
 }

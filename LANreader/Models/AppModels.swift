@@ -45,14 +45,6 @@ enum ReadDirection: String, CaseIterable, Identifiable {
     var id: String { self.rawValue }
 }
 
-enum ArchiveListOrder: String, CaseIterable, Identifiable {
-    case name
-    case dateAdded
-    case random
-
-    var id: String { self.rawValue }
-}
-
 enum SearchSort: String, CaseIterable, Identifiable {
     case name = "title"
     case dateAdded = "date_added"
@@ -76,18 +68,6 @@ enum SearchSortOrder: String, CaseIterable, Identifiable {
     var id: String { self.rawValue }
 }
 
-enum CompressThreshold: Int, CaseIterable, Identifiable {
-    case never, one, two, three, four
-
-    var id: Int { self.rawValue }
-}
-
-enum ArchiveSelectFor: Int, CaseIterable, Identifiable {
-    case library, categoryStatic, categoryDynamic, search
-
-    var id: Int { self.rawValue }
-}
-
 struct SettingsKey {
     static let lanraragiUrl = "settings:lanraragi:url"
     static let lanraragiApiKey = "settings:lanraragi:apiKey"
@@ -97,12 +77,14 @@ struct SettingsKey {
     static let tapMiddleKey = "settings:read:tap:middle"
     static let tapRightKey = "settings:read:tap:right"
     static let readDirection = "settings:read:direction"
+    static let disablePageFlipAnimation = "settings:read:disable:page:flip:animation"
     static let showOriginal = "settings:read:image:showOriginal"
     static let splitWideImage = "settings:read:split:Image"
     static let splitPiorityLeft = "settings:read:split:piorityLeft"
     static let autoPageInterval = "settings:read:auto:page:interval"
     static let doublePageLayout = "settings:read:double:page"
     static let fitPageWidth = "settings:read:fit:page:width"
+    static let showStamps = "settings:read:show:stamps"
     static let restartFinished = "settings:read:restart:finished"
 
     static let searchSort = "settings:search:sort"

@@ -9,6 +9,7 @@ import SwiftUI
         @Shared(.appStorage(SettingsKey.tapMiddleKey)) var tapMiddle = PageControl.navigation.rawValue
         @Shared(.appStorage(SettingsKey.tapRightKey)) var tapRight = PageControl.previous.rawValue
         @Shared(.appStorage(SettingsKey.readDirection)) var readDirection = ReadDirection.leftRight.rawValue
+        @Shared(.appStorage(SettingsKey.disablePageFlipAnimation)) var disablePageFlipAnimation = false
         @Shared(.appStorage(SettingsKey.showOriginal)) var showOriginal = false
         @Shared(.appStorage(SettingsKey.splitWideImage)) var splitWideImage = false
         @Shared(.appStorage(SettingsKey.splitPiorityLeft)) var splitPiorityLeft = false
@@ -19,7 +20,6 @@ import SwiftUI
     public enum Action: BindableAction {
         case binding(BindingAction<State>)
         case splitWideImageChanged(Bool)
-        case doublePageLayoutChanged(Bool)
     }
 
     public var body: some ReducerOf<Self> {
@@ -31,12 +31,6 @@ import SwiftUI
                 state.$splitWideImage.withLock { $0 = isEnabled }
                 if isEnabled {
                     state.$doublePageLayout.withLock { $0 = false }
-                }
-                return .none
-            case let .doublePageLayoutChanged(isEnabled):
-                state.$doublePageLayout.withLock { $0 = isEnabled }
-                if isEnabled {
-                    state.$splitWideImage.withLock { $0 = false }
                 }
                 return .none
             case .binding:
@@ -56,6 +50,8 @@ struct ReadSettings: View {
             Text("settings.read.direction.upDown").tag(ReadDirection.upDown.rawValue)
         }
         .padding()
+        Toggle("settings.read.disable.page.flip.animation", isOn: Binding(self.store.$disablePageFlipAnimation))
+            .padding()
         if store.readDirection != ReadDirection.upDown.rawValue {
             Picker("settings.read.tap.left", selection: Binding(self.store.$tapLeft)) {
                 pageControlSelectionView
@@ -73,13 +69,6 @@ struct ReadSettings: View {
             .padding()
         }
         if store.readDirection != ReadDirection.upDown.rawValue {
-            Toggle(isOn: Binding(
-                get: { self.store.doublePageLayout },
-                set: { self.store.send(.doublePageLayoutChanged($0)) }
-            )) {
-                Text("settings.read.double.page")
-            }
-            .padding()
             Toggle("settings.read.fit.page.width", isOn: Binding(self.store.$fitPageWidth))
                 .padding()
         }

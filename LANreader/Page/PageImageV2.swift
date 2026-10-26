@@ -24,9 +24,24 @@ import Logging
         let cached: Bool
         var imageLoaded = false
         var translationStatus = ""
+        var stamps: [ArchiveStamp] = []
+        var stampsLoading = false
+        var stampsLoaded = false
+        /// Aspect ratio (height / width) of the source image, measured from the image header.
+        var imageAspectRatio: Double?
+        var storedImageURL: URL?
 
         public var id: String {
             "\(pageId)-\(suffix)"
+        }
+
+        /// Aspect ratio of what this page actually renders. Split pages show half of the source
+        /// image width, so they are twice as tall relative to their width.
+        var displayAspectRatio: Double? {
+            guard let imageAspectRatio else { return nil }
+            return pageMode.isSplitMode
+                ? ReaderPageLayout.splitAspectRatio(for: imageAspectRatio)
+                : imageAspectRatio
         }
 
         let folder: URL?
@@ -58,6 +73,9 @@ import Logging
 
     public enum Action: Equatable {
         case load(Bool)
+        case loadStamps
+        case stampsLoaded([ArchiveStamp])
+        case stampsLoadFailed(endpointUnavailable: Bool)
         case setIsLoading(Bool)
         case subscribeToProgress(DownloadRequest)
         case cancelSubscribeImageProgress
@@ -75,11 +93,44 @@ import Logging
     public enum CancelId: Sendable {
         case imageLoad
         case imageProgress
+        case stampsLoad
     }
 
     public var body: some ReducerOf<Self> {
         Reduce { state, action in
             switch action {
+            case .loadStamps:
+                guard !state.cached, !state.stampsLoading, !state.stampsLoaded else {
+                    return .none
+                }
+                state.stampsLoading = true
+                let archiveId = state.sourceArchiveId
+                let page = state.sourcePageNumber
+                return .run { send in
+                    do {
+                        let response = try await service.retrieveStamps(id: archiveId, page: page).value
+                        await send(.stampsLoaded(response.result))
+                    } catch is CancellationError {
+                        return
+                    } catch {
+                        logger.warning(
+                            "failed to load stamps. archive=\(archiveId) page=\(page) \(error.localizedDescription)"
+                        )
+                        await send(.stampsLoadFailed(endpointUnavailable: error.asAFError?.responseCode == 404))
+                    }
+                }
+                .cancellable(id: CancelId.stampsLoad, cancelInFlight: true)
+            case let .stampsLoaded(stamps):
+                state.stamps = stamps
+                state.stampsLoading = false
+                state.stampsLoaded = true
+                return .none
+            case let .stampsLoadFailed(endpointUnavailable):
+                state.stampsLoading = false
+                // Avoid repeated requests only when the server does not expose this endpoint.
+                // Transient failures remain retryable when stamps are shown again.
+                state.stampsLoaded = endpointUnavailable
+                return .none
             case let .subscribeToProgress(progress):
                 return .run(priority: .utility) { send in
                     var step: Double = 0.0
@@ -109,7 +160,12 @@ import Logging
                 state.imageLoaded = false
 
                 if force {
+                    if state.pageMode.isSplitMode {
+                        state.pendingSplitMode = state.pageMode
+                    }
                     state.pageMode = .loading
+                    state.imageAspectRatio = nil
+                    state.storedImageURL = nil
                 } else if state.pageMode == .loading {
                     let normalPath = imageService.storedImagePath(
                         folderUrl: state.folder,
@@ -117,8 +173,10 @@ import Logging
                     )
 
                     if let normalPath {
+                        state.storedImageURL = normalPath
                         let shouldDisplayAsSplitPages = state.splitImage
                             && imageService.shouldSplitWideImage(imageUrl: normalPath)
+                        state.imageAspectRatio = imageService.imageAspectRatio(imageUrl: normalPath)
                         return applyStoredImage(
                             shouldDisplayAsSplitPages: shouldDisplayAsSplitPages,
                             state: &state
@@ -194,16 +252,19 @@ import Logging
                                     }
                                 }
 
-                                let storedPageImage = imageService.storePageImage(
+                                guard let storedPageImage = imageService.storePageImage(
                                     imageUrl: imageUrl,
                                     imageData: translated,
                                     destinationUrl: state.folder!,
                                     pageNumber: String(state.pageNumber),
                                     splitWideImages: state.splitImage
-                                )
+                                ) else {
+                                    await send(.setError(String(localized: "archive.page.store.failed")))
+                                    return
+                                }
                                 await send(
                                     .setStoredImage(
-                                        shouldDisplayAsSplitPages: storedPageImage?.shouldDisplayAsSplitPages ?? false
+                                        shouldDisplayAsSplitPages: storedPageImage.shouldDisplayAsSplitPages
                                     )
                                 )
                             } catch is CancellationError {
@@ -236,6 +297,7 @@ import Logging
                 state.imageLoaded = true
                 state.errorMessage = message
                 state.pendingSplitMode = nil
+                state.storedImageURL = nil
                 return .none
             case .storedImageResolved:
                 return .none
@@ -253,6 +315,15 @@ import Logging
         state.progress = 0
         state.loading = false
         state.imageLoaded = true
+        if state.storedImageURL == nil {
+            state.storedImageURL = imageService.storedImagePath(
+                folderUrl: state.folder,
+                pageNumber: String(state.pageNumber)
+            )
+        }
+        if state.imageAspectRatio == nil, let storedImageURL = state.storedImageURL {
+            state.imageAspectRatio = imageService.imageAspectRatio(imageUrl: storedImageURL)
+        }
 
         if shouldDisplayAsSplitPages {
             return .send(.storedImageResolved(shouldDisplayAsSplitPages: true))

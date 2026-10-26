@@ -4,6 +4,30 @@ import SwiftUI
 import NotificationBannerSwift
 import Logging
 
+@MainActor
+func showNotificationBanner(title: String, subtitle: String, style: BannerStyle) {
+    let banner = FloatingNotificationBanner(title: title, subtitle: subtitle, style: style)
+    let safeAreaInsets = UIApplication.shared.connectedScenes
+        .compactMap { $0 as? UIWindowScene }
+        .flatMap(\.windows)
+        .first(where: \.isKeyWindow)?
+        .safeAreaInsets ?? .zero
+
+    banner.show(
+        edgeInsets: notificationBannerEdgeInsets(safeAreaInsets: safeAreaInsets),
+        cornerRadius: 14
+    )
+}
+
+func notificationBannerEdgeInsets(safeAreaInsets: UIEdgeInsets) -> UIEdgeInsets {
+    UIEdgeInsets(
+        top: safeAreaInsets.top + 8,
+        left: safeAreaInsets.left + 8,
+        bottom: 8,
+        right: safeAreaInsets.right + 8
+    )
+}
+
 @Reducer public struct AppFeature: Sendable {
     private let logger = Logger(label: "AppFeature")
 
@@ -15,7 +39,10 @@ import Logging
         @SharedReader(.appStorage(SettingsKey.passcode)) var storedPasscode = ""
         @SharedReader(.appStorage(SettingsKey.blurInterfaceWhenInactive)) var blurInterfaceWhenInactive = false
 
+        @Shared(.archive) var archiveItems: IdentifiedArrayOf<ArchiveItem> = []
+
         var tabName = "library"
+        var pendingDeepLink: DeepLinkRoute?
         var successMessage = ""
         var errorMessage = ""
 
@@ -37,6 +64,9 @@ import Logging
 
         case showLogin
         case showLockScreen
+        case openURL(URL)
+        case deepLinkArchiveLoaded(ArchiveItem, cached: Bool)
+        case deepLinkHandled
         case queueUrlDownload(URL)
         case setErrorMessage(String)
         case setSuccessMessage(String)
@@ -70,6 +100,28 @@ import Logging
                 state.destination = .lockScreen(
                     LockScreenFeature.State(lockState: .normal)
                 )
+                return .none
+            case let .openURL(url):
+                switch DeepLink(url: url) {
+                case let .read(archiveId, preferCached):
+                    return loadDeepLinkArchive(id: archiveId, preferCached: preferCached)
+                case let .search(query):
+                    state.pendingDeepLink = .search(query: query)
+                    return .send(.search(.recentSearchTapped(query)))
+                case let .download(downloadURL):
+                    return .send(.queueUrlDownload(downloadURL))
+                case nil:
+                    logger.warning("ignored unsupported link. url=\(url)")
+                    return .none
+                }
+            case let .deepLinkArchiveLoaded(archive, cached):
+                if !cached {
+                    state.$archiveItems.withLock { _ = $0.updateOrAppend(archive) }
+                }
+                state.pendingDeepLink = .reader(archive, cached: cached)
+                return .none
+            case .deepLinkHandled:
+                state.pendingDeepLink = nil
                 return .none
             case let .queueUrlDownload(url):
                 return .run { send in
@@ -108,6 +160,40 @@ import Logging
             }
         }
         .ifLet(\.$destination, action: \.destination)
+    }
+
+    private func loadDeepLinkArchive(id: String, preferCached: Bool) -> Effect<Action> {
+        .run { send in
+            if preferCached, let cache = try? database.readCache(id), cache.cached {
+                await send(.deepLinkArchiveLoaded(cache.toArchiveItem(), cached: true))
+                return
+            }
+            do {
+                let archive = if id.isTankoubonArchiveId {
+                    try await tankoubonArchiveItem(id: id)
+                } else {
+                    try await service.retrieveArchiveMetadata(id: id).value.toArchiveItem()
+                }
+                await send(.deepLinkArchiveLoaded(archive, cached: false))
+            } catch {
+                logger.error("failed to open archive from link. id=\(id) \(error)")
+                await send(.setErrorMessage(String(localized: "error.deeplink.archive")))
+            }
+        }
+    }
+
+    private func tankoubonArchiveItem(id: String) async throws -> ArchiveItem {
+        let tankoubon = try await service.retrieveFullTankoubon(id: id).value.result
+        return ArchiveItem(
+            id: tankoubon.id,
+            name: tankoubon.name ?? "",
+            extension: "",
+            tags: tankoubon.tags ?? "",
+            isNew: false,
+            progress: tankoubon.progress ?? 0,
+            pagecount: tankoubon.fullData?.reduce(0) { $0 + $1.pagecount } ?? 0,
+            dateAdded: nil
+        )
     }
 
     @Reducer
@@ -156,27 +242,25 @@ struct ContentView: View {
                 }
             }
             .onOpenURL { url in
-                store.send(.queueUrlDownload(url))
+                store.send(.openURL(url))
             }
             .onChange(of: store.errorMessage) {
                 if !store.errorMessage.isEmpty {
-                    let banner = NotificationBanner(
+                    showNotificationBanner(
                         title: String(localized: "error"),
                         subtitle: store.errorMessage,
                         style: .danger
                     )
-                    banner.show()
                     store.send(.setErrorMessage(""))
                 }
             }
             .onChange(of: store.successMessage) {
                 if !store.successMessage.isEmpty {
-                    let banner = NotificationBanner(
+                    showNotificationBanner(
                         title: String(localized: "success"),
                         subtitle: store.successMessage,
                         style: .success
                     )
-                    banner.show()
                     store.send(.setSuccessMessage(""))
                 }
             }

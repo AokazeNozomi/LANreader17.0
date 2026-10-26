@@ -6,10 +6,11 @@ import Foundation
 import Alamofire
 import Logging
 import Dependencies
+import os
 
 actor LANraragiService {
     public static let downloadPath = try? FileManager.default.url(
-        for: .documentDirectory,
+        for: .cachesDirectory,
         in: .userDomainMask,
         appropriateFor: nil,
         create: true
@@ -19,7 +20,7 @@ actor LANraragiService {
     public static let cachePath = try? FileManager.default.url(
         for: .documentDirectory,
         in: .userDomainMask,
-        appropriateFor: .picturesDirectory,
+        appropriateFor: nil,
         create: true
     )
     .appendingPathComponent("cached", conformingTo: .folder)
@@ -27,6 +28,7 @@ actor LANraragiService {
     private static let logger = Logger(label: "LANraragiService")
 
     private static let newAPIMinVersion = "0.9.70"
+    private static let stampsMinVersion = "0.9.80"
 
     static let shared = LANraragiService()
 
@@ -38,10 +40,16 @@ actor LANraragiService {
 
     private var urlSession: URLSession?
     private var urlSessionDelegate: URLSessionDelegateHandler?
+    private let backgroundSessionConfiguration: URLSessionConfiguration?
+    private var queuingCacheIDs: Set<String> = []
 
-    private(set) var useNewAPI: Bool = false
+    // shortcut: Offline startup assumes the new API; revisit if legacy-server recovery is needed.
+    private(set) var useNewAPI: Bool = true
+    private(set) var supportsStamps: Bool?
+    private(set) var supportsChapterMutations: Bool?
 
-    private init() {
+    init(backgroundSessionConfiguration: URLSessionConfiguration? = nil) {
+        self.backgroundSessionConfiguration = backgroundSessionConfiguration
         self.session = Session(interceptor: authInterceptor)
         self.snakeCaseEncoder = JSONDecoder()
         self.snakeCaseEncoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -51,7 +59,8 @@ actor LANraragiService {
         if let urlSession = urlSession {
             return urlSession
         }
-        let config = URLSessionConfiguration.background(withIdentifier: "com.jif.LANreader.download")
+        let config = backgroundSessionConfiguration
+            ?? URLSessionConfiguration.background(withIdentifier: "com.jif.LANreader.download")
         config.isDiscretionary = false
         config.httpMaximumConnectionsPerHost = 5
         let delegate = URLSessionDelegateHandler(imageService: imageService)
@@ -85,7 +94,7 @@ actor LANraragiService {
         self.url = url
         self.authInterceptor = result.interceptor
         self.session = result.session
-        updateAPIVersionFlag(serverVersion: result.serverInfo.version)
+        updateServerCapabilities(serverVersion: result.serverInfo.version)
         return result.serverInfo
     }
 
@@ -100,15 +109,20 @@ actor LANraragiService {
 
         do {
             let result = try await fetchServerInfo(url: storedUrl, apiKey: storedApiKey)
-            updateAPIVersionFlag(serverVersion: result.serverInfo.version)
+            updateServerCapabilities(serverVersion: result.serverInfo.version)
         } catch {
             Self.logger.warning("Failed to check server version at startup: \(error.localizedDescription)")
         }
     }
 
-    func updateAPIVersionFlag(serverVersion: String) {
+    func updateServerCapabilities(serverVersion: String) {
         self.useNewAPI = Self.compareVersions(serverVersion, isAtLeast: Self.newAPIMinVersion)
-        Self.logger.info("Server version: \(serverVersion), using new API: \(self.useNewAPI)")
+        self.supportsStamps = Self.compareVersions(serverVersion, isAtLeast: Self.stampsMinVersion)
+        self.supportsChapterMutations = self.useNewAPI
+        let supportsStamps = self.supportsStamps == true
+        Self.logger.info(
+            "Server version: \(serverVersion), using new API: \(self.useNewAPI), supports stamps: \(supportsStamps)"
+        )
     }
 
     private static func compareVersions(_ version: String, isAtLeast minVersion: String) -> Bool {
@@ -269,6 +283,12 @@ actor LANraragiService {
             .serializingDecodable(ArchiveRandomResponse.self)
     }
 
+    func retrieveArchiveMetadata(id: String) async -> DataTask<ArchiveIndexResponse> {
+        session.request("\(url)/api/archives/\(id)/metadata")
+            .validate(statusCode: 200...200)
+            .serializingDecodable(ArchiveIndexResponse.self)
+    }
+
     func retrieveTankoubon(id: String) async -> DataTask<TankoubonMetadataResponse> {
         session.request("\(url)/api/tankoubons/\(id)")
             .validate(statusCode: 200...200)
@@ -283,6 +303,7 @@ actor LANraragiService {
 
     func updateTankoubon(
         id: String,
+        archives: [String]? = nil,
         name: String? = nil,
         summary: String? = nil,
         tags: String? = nil,
@@ -300,7 +321,7 @@ actor LANraragiService {
             metadata = nil
         }
 
-        let request = TankoubonUpdateRequest(metadata: metadata)
+        let request = TankoubonUpdateRequest(archives: archives, metadata: metadata)
         return session.request(
             "\(url)/api/tankoubons/\(id)",
             method: .put,
@@ -309,6 +330,17 @@ actor LANraragiService {
         )
         .validate(statusCode: 200...200)
         .serializingDecodable(GenericSuccessResponse.self)
+    }
+
+    func createTankoubon(name: String) async -> DataTask<TankoubonCreateResponse> {
+        session.request(
+            "\(url)/api/tankoubons",
+            method: .put,
+            parameters: ["name": name],
+            encoding: URLEncoding(destination: .httpBody)
+        )
+        .validate(statusCode: 200...200)
+        .serializingDecodable(TankoubonCreateResponse.self)
     }
 
     func deleteTankoubon(id: String) async -> DataTask<GenericSuccessResponse> {
@@ -393,6 +425,70 @@ actor LANraragiService {
         }
     }
 
+    func retrieveStamps(id: String, page: Int) async -> DataTask<ArchiveStampsResponse> {
+        session.request("\(url)/api/archives/\(id)/stamps/\(page)", method: .get)
+            .validate(statusCode: 200...200)
+            .serializingDecodable(ArchiveStampsResponse.self)
+    }
+
+    func addArchiveChapter(id: String, page: Int, title: String) async -> DataTask<GenericSuccessResponse> {
+        session.request(
+            "\(url)/api/archives/\(id)/toc",
+            method: .put,
+            parameters: ["page": page, "title": title],
+            encoding: URLEncoding(destination: .queryString)
+        )
+        .validate(statusCode: 200...200)
+        .serializingDecodable(GenericSuccessResponse.self)
+    }
+
+    func deleteArchiveChapter(id: String, page: Int) async -> DataTask<GenericSuccessResponse> {
+        session.request(
+            "\(url)/api/archives/\(id)/toc",
+            method: .delete,
+            parameters: ["page": page],
+            encoding: URLEncoding(destination: .queryString)
+        )
+        .validate(statusCode: 200...200)
+        .serializingDecodable(GenericSuccessResponse.self)
+    }
+
+    func addStamp(
+        id: String,
+        page: Int,
+        content: String,
+        position: String
+    ) async -> DataTask<AddStampResponse> {
+        session.request(
+            "\(url)/api/archives/\(id)/stamps/\(page)",
+            method: .put,
+            parameters: [
+                "content": content,
+                "position": position
+            ],
+            encoding: URLEncoding(destination: .queryString)
+        )
+        .validate(statusCode: 200...200)
+        .serializingDecodable(AddStampResponse.self)
+    }
+
+    func updateStamp(id: String, content: String) async -> DataTask<GenericSuccessResponse> {
+        session.request(
+            "\(url)/api/stamps/\(id)",
+            method: .put,
+            parameters: ["content": content],
+            encoding: URLEncoding(destination: .queryString)
+        )
+        .validate(statusCode: 200...200)
+        .serializingDecodable(GenericSuccessResponse.self)
+    }
+
+    func deleteStamp(id: String) async -> DataTask<GenericSuccessResponse> {
+        session.request("\(url)/api/stamps/\(id)", method: .delete)
+            .validate(statusCode: 200...200)
+            .serializingDecodable(GenericSuccessResponse.self)
+    }
+
     private func resolveArchivePageURL(page: String) -> URL {
         let baseURL = getDomainURL(from: self.url)
         return URL(string: page, relativeTo: baseURL)!.absoluteURL
@@ -401,14 +497,6 @@ actor LANraragiService {
     func fetchArchivePage(page: String, pageNumber _: Int) -> DownloadRequest {
         let request = URLRequest(url: resolveArchivePageURL(page: page))
         return session.download(request).validate()
-    }
-
-    func backgroupFetchArchivePage(page: String, archiveId: String, pageNumber: Int) {
-        var request = URLRequest(url: resolveArchivePageURL(page: page))
-        request.setValue("Bearer \(authInterceptor.encodedApiKey())", forHTTPHeaderField: "Authorization")
-        request.setValue(archiveId, forHTTPHeaderField: "X-Archive-Id")
-        request.setValue("\(pageNumber)", forHTTPHeaderField: "X-Page-Number")
-        getURLSession().downloadTask(with: request).resume()
     }
 
     func clearNewFlag(id: String) -> DataTask<String> {
@@ -493,6 +581,62 @@ actor LANraragiService {
     }
 }
 
+extension LANraragiService {
+    func backgroupFetchArchivePage(page: String, archiveId: String, pageNumber: Int) {
+        var request = URLRequest(url: resolveArchivePageURL(page: page))
+        request.setValue("Bearer \(authInterceptor.encodedApiKey())", forHTTPHeaderField: "Authorization")
+        request.setValue(archiveId, forHTTPHeaderField: "X-Archive-Id")
+        request.setValue("\(pageNumber)", forHTTPHeaderField: "X-Page-Number")
+        let task = getURLSession().downloadTask(with: request)
+        urlSessionDelegate?.track(task)
+        task.resume()
+    }
+
+    func activeCacheDownloadIDs() async -> Set<String> {
+        let tasks = await getURLSession().allTasks
+        let restoredIDs = tasks.compactMap { task in
+            task.state == .completed ? nil : task.originalRequest?.value(forHTTPHeaderField: "X-Archive-Id")
+        }
+        return queuingCacheIDs.union(urlSessionDelegate?.activeArchiveIDs() ?? []).union(restoredIDs)
+    }
+
+    func cachePages(archiveId: String, pages: [ReaderExtractedPage]) async throws {
+        guard queuingCacheIDs.insert(archiveId).inserted else { return }
+        defer { queuingCacheIDs.remove(archiveId) }
+        let tasks = await getURLSession().allTasks
+        try Task.checkCancellation()
+        guard queuingCacheIDs.contains(archiveId) else { return }
+        urlSessionDelegate?.resumeDownloads(archiveId: archiveId)
+        let activePages = Set(tasks.compactMap { task -> Int? in
+            guard task.state != .completed,
+                  task.originalRequest?.value(forHTTPHeaderField: "X-Archive-Id") == archiveId else { return nil }
+            return task.originalRequest?.value(forHTTPHeaderField: "X-Page-Number").flatMap(Int.init)
+        }).union(urlSessionDelegate?.activePageNumbers(archiveId: archiveId) ?? [])
+        let folder = Self.cachePath?.appendingPathComponent(archiveId, conformingTo: .folder)
+        let storedPages = imageService.validStoredPageNumbers(folderUrl: folder, totalPages: pages.count)
+        // shortcut: Retry assumes unchanged source page order; add a mapping if mutable books need support.
+        for (index, page) in pages.enumerated() where !storedPages.contains(index + 1)
+            && !activePages.contains(index + 1) {
+            try Task.checkCancellation()
+            backgroupFetchArchivePage(page: page.path, archiveId: archiveId, pageNumber: index + 1)
+        }
+    }
+
+    func removeCachedPages(archiveId: String) async {
+        queuingCacheIDs.remove(archiveId)
+        let session = getURLSession()
+        urlSessionDelegate?.discardDownloads(archiveId: archiveId)
+        for task in await session.allTasks
+        where task.originalRequest?.value(forHTTPHeaderField: "X-Archive-Id") == archiveId {
+            task.cancel()
+        }
+        if let folder = Self.cachePath?.appendingPathComponent(archiveId, conformingTo: .folder) {
+            try? FileManager.default.removeItem(at: folder)
+        }
+    }
+
+}
+
 final class AuthInterceptor: RequestInterceptor, Sendable {
 
     private let apiKey: String
@@ -517,24 +661,71 @@ final class AuthInterceptor: RequestInterceptor, Sendable {
 // Separate class to handle URLSession delegate callbacks since actors can't conform to @objc protocols
 final class URLSessionDelegateHandler: NSObject, URLSessionDelegate, URLSessionDownloadDelegate, Sendable {
     private let imageService: ImageService
+    private let activeRequests = OSAllocatedUnfairLock(initialState: [Int: URLRequest]())
+    private let discardedArchiveIDs = OSAllocatedUnfairLock(initialState: Set<String>())
+    private let logger = Logger(label: "CacheDownload")
 
     init(imageService: ImageService) {
         self.imageService = imageService
     }
 
+    func track(_ task: URLSessionTask) {
+        guard let request = task.originalRequest else { return }
+        activeRequests.withLock { $0[task.taskIdentifier] = request }
+    }
+
+    func activeArchiveIDs() -> Set<String> {
+        activeRequests.withLock { requests in
+            Set(requests.values.compactMap { $0.value(forHTTPHeaderField: "X-Archive-Id") })
+        }
+    }
+
+    func activePageNumbers(archiveId: String) -> Set<Int> {
+        activeRequests.withLock { requests in
+            Set(requests.values.compactMap { request in
+                guard request.value(forHTTPHeaderField: "X-Archive-Id") == archiveId else { return nil }
+                return request.value(forHTTPHeaderField: "X-Page-Number").flatMap(Int.init)
+            })
+        }
+    }
+
+    func discardDownloads(archiveId: String) {
+        discardedArchiveIDs.withLock { _ = $0.insert(archiveId) }
+    }
+
+    func resumeDownloads(archiveId: String) {
+        discardedArchiveIDs.withLock { _ = $0.remove(archiveId) }
+    }
+
+    func urlSession(_: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        activeRequests.withLock { _ = $0.removeValue(forKey: task.taskIdentifier) }
+        if let error {
+            logger.error("Cache download failed: \(error.localizedDescription)")
+        }
+    }
+
     func urlSession(_: URLSession, downloadTask task: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        track(task)
+        guard let response = task.response as? HTTPURLResponse, response.statusCode == 200 else {
+            logger.error("Cache download returned an unsuccessful response")
+            return
+        }
         let splitImage = UserDefaults.standard.bool(forKey: SettingsKey.splitWideImage)
 
         if let archiveId = task.originalRequest?.value(forHTTPHeaderField: "X-Archive-Id"),
            let pageNumber = task.originalRequest?.value(forHTTPHeaderField: "X-Page-Number"),
+           !discardedArchiveIDs.withLock({ $0.contains(archiveId) }),
            let cachePath = LANraragiService.cachePath {
             let folder = cachePath.appendingPathComponent(archiveId, conformingTo: .folder)
-            _ = imageService.storePageImage(
+            let stored = imageService.storePageImage(
                 imageUrl: location,
                 destinationUrl: folder,
                 pageNumber: pageNumber,
                 splitWideImages: splitImage
             )
+            if stored == nil {
+                logger.error("Cache page was invalid or could not be saved. archive=\(archiveId) page=\(pageNumber)")
+            }
         }
     }
 }
