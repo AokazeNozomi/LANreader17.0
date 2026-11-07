@@ -1,7 +1,6 @@
 import ComposableArchitecture
 import Logging
 import SwiftUI
-import NotificationBannerSwift
 
 @Reducer public struct CategoryFeature: Sendable {
     private let logger = Logger(label: "CategoryFeature")
@@ -15,9 +14,7 @@ import NotificationBannerSwift
         var errorMessage = ""
     }
 
-    public enum Action: BindableAction {
-        case binding(BindingAction<State>)
-
+    public enum Action {
         case loadCategory(Bool)
         case populateCategory([CategoryItem])
         case setErrorMessage(String)
@@ -26,26 +23,14 @@ import NotificationBannerSwift
     @Dependency(\.lanraragiService) var service
 
     public var body: some ReducerOf<Self> {
-        BindingReducer()
-
         Reduce { state, action in
             switch action {
             case let .loadCategory(loading):
                 state.showLoading = loading
                 return .run { send in
                     let categories = try await service.retrieveCategories().value
-                    let items = categories
-                        .map { item in
-                            item.toCategoryItem()
-                        }
-                        .enumerated()
-                        .sorted { first, second in
-                            if first.element.pinned == second.element.pinned {
-                                return first.offset < second.offset
-                            }
-                            return first.element.pinned == "1"
-                        }
-                        .map { $0.element }
+                    let items = categories.map { $0.toCategoryItem() }
+                        .sorted { $0.pinned == "1" && $1.pinned != "1" }
                     await send(.populateCategory(items))
                 } catch: { error, send in
                     logger.error("failed to load category. \(error)")
@@ -59,8 +44,9 @@ import NotificationBannerSwift
                 return .none
             case let .setErrorMessage(message):
                 state.errorMessage = message
-                return .none
-            case .binding:
+                if !message.isEmpty {
+                    state.showLoading = false
+                }
                 return .none
             }
         }
@@ -68,7 +54,7 @@ import NotificationBannerSwift
 }
 
 struct CategoryListV2: View {
-    @Bindable var store: StoreOf<CategoryFeature>
+    let store: StoreOf<CategoryFeature>
     let onTapCategory: (StoreOf<CategoryArchiveListFeature>) -> Void
     @State private var searchText = ""
 
@@ -92,12 +78,11 @@ struct CategoryListV2: View {
         }
         .onChange(of: store.errorMessage) {
             if !store.errorMessage.isEmpty {
-                let banner = NotificationBanner(
+                showNotificationBanner(
                     title: String(localized: "error"),
                     subtitle: store.errorMessage,
                     style: .danger
                 )
-                banner.show()
                 store.send(.setErrorMessage(""))
             }
         }

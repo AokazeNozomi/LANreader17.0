@@ -28,14 +28,154 @@ class LANreaderTests: XCTestCase {
         tempDirectory = nil
     }
 
-    func testStorePreviewImageRejectsTruncatedJPEGData() throws {
+    func testStorePreviewImageRejectsNonImageData() throws {
         let previewURL = tempDirectory.appendingPathComponent("preview.jpg")
         let service = ImageService.shared
 
-        let truncatedJPEG = makeJPEGData(color: .systemBlue).dropLast(32)
+        let errorPage = Data("<html>Unauthorized</html>".utf8)
 
-        XCTAssertFalse(service.storePreviewImage(imageData: truncatedJPEG, destinationUrl: previewURL))
+        XCTAssertFalse(service.storePreviewImage(imageData: errorPage, destinationUrl: previewURL))
         XCTAssertFalse(FileManager.default.fileExists(atPath: previewURL.path(percentEncoded: false)))
+    }
+
+    func testStorePageImageRejectsNonImagePayloads() throws {
+        let source = tempDirectory.appendingPathComponent("download.tmp")
+        let folder = tempDirectory.appendingPathComponent("pages")
+        let payloads = [
+            Data(), Data("<html>Unauthorized</html>".utf8), Data("{\"error\":\"failed\"}".utf8)
+        ]
+        for payload in payloads {
+            try payload.write(to: source)
+            XCTAssertNil(ImageService.shared.storePageImage(
+                imageUrl: source, destinationUrl: folder, pageNumber: "1"
+            ))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
+    }
+
+    func testStorePageImageAcceptsImagesWithDataAfterEndMarker() throws {
+        let source = tempDirectory.appendingPathComponent("download.tmp")
+        let folder = tempDirectory.appendingPathComponent("pages")
+        let trailer = Data("trailing metadata".utf8) + Data(repeating: 0, count: 64)
+        for image in [makeTransparentPNGData(), makeJPEGData(color: .red)] {
+            try (image + trailer).write(to: source)
+
+            XCTAssertNotNil(ImageService.shared.storePageImage(
+                imageUrl: source, destinationUrl: folder, pageNumber: "1"
+            ))
+        }
+    }
+
+    func testValidStoredPageNumbersCountsOnlyDistinctReadableImagesInRange() throws {
+        let good = makeJPEGData(color: .blue)
+        for filename in ["0.jpg", "1.jpg", "1.png", "4.jpg"] {
+            try good.write(to: tempDirectory.appendingPathComponent(filename))
+        }
+        try Data("error".utf8).write(to: tempDirectory.appendingPathComponent("2.jpg"))
+        try Data("{\"error\":\"failed\"}".utf8).write(to: tempDirectory.appendingPathComponent("3.jpg"))
+        XCTAssertEqual(ImageService.shared.validStoredPageNumbers(folderUrl: tempDirectory, totalPages: 3), [1])
+    }
+
+    func testStoredPageNumbersCountsStoredPagesByName() throws {
+        let good = makeJPEGData(color: .blue)
+        for filename in ["0.jpg", "1.jpg", "2.png", "4.jpg", "cover.jpg"] {
+            try good.write(to: tempDirectory.appendingPathComponent(filename))
+        }
+        XCTAssertEqual(ImageService.shared.storedPageNumbers(folderUrl: tempDirectory, totalPages: 3), [1, 2])
+    }
+
+    func testStoredImagePathFindsStoredPageByNumber() throws {
+        try makeJPEGData(color: .blue).write(to: tempDirectory.appendingPathComponent("3.jpg"))
+
+        XCTAssertEqual(
+            ImageService.shared.storedImagePath(folderUrl: tempDirectory, pageNumber: "3")?.lastPathComponent,
+            "3.jpg"
+        )
+        XCTAssertNil(ImageService.shared.storedImagePath(folderUrl: tempDirectory, pageNumber: "4"))
+    }
+
+    func testReadingSessionPagesLiveInCachesAndOfflineCachesAreExcludedFromBackup() throws {
+        let sessionFolder = try XCTUnwrap(LANraragiService.downloadPath)
+        let cachesFolder = try FileManager.default.url(
+            for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: false
+        )
+        XCTAssertEqual(sessionFolder.deletingLastPathComponent().standardizedFileURL, cachesFolder.standardizedFileURL)
+
+        let cacheFolder = try XCTUnwrap(LANraragiService.cachePath)
+        let values = try cacheFolder.resourceValues(forKeys: [.isExcludedFromBackupKey])
+        XCTAssertEqual(values.isExcludedFromBackup, true)
+    }
+
+    func testExcludeFromBackupCreatesAndMarksFolder() throws {
+        let folder = tempDirectory.appendingPathComponent("cached", conformingTo: .folder)
+
+        try PageStorage.excludeFromBackup(folder)
+
+        let values = try folder.resourceValues(forKeys: [.isExcludedFromBackupKey])
+        XCTAssertEqual(values.isExcludedFromBackup, true)
+    }
+
+    func testStaleLaunchItemsSkipPagesDownloadedAfterLaunch() throws {
+        let fileManager = FileManager.default
+        let temporaryFolder = tempDirectory.appendingPathComponent("tmp", conformingTo: .folder)
+        let sessionFolder = tempDirectory.appendingPathComponent("current session", conformingTo: .folder)
+        let legacyFolder = tempDirectory.appendingPathComponent("legacy session", conformingTo: .folder)
+        let oldPage = sessionFolder.appendingPathComponent("archive/1.jpg")
+        for folder in [temporaryFolder, oldPage.deletingLastPathComponent(), legacyFolder] {
+            try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        try Data("old".utf8).write(to: temporaryFolder.appendingPathComponent("download.tmp"))
+        try makeJPEGData(color: .blue).write(to: oldPage)
+
+        let staleItems = PageStorage.takeStaleItems(
+            temporaryFolder: temporaryFolder,
+            sessionFolder: sessionFolder,
+            legacySessionFolder: legacyFolder
+        )
+        XCTAssertFalse(fileManager.fileExists(atPath: sessionFolder.path))
+        let newPage = sessionFolder.appendingPathComponent("archive/1.jpg")
+        try fileManager.createDirectory(at: newPage.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try makeJPEGData(color: .red).write(to: newPage)
+
+        PageStorage.remove(staleItems)
+
+        XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: temporaryFolder.path), [])
+        XCTAssertFalse(fileManager.fileExists(atPath: legacyFolder.path))
+        XCTAssertTrue(fileManager.fileExists(atPath: newPage.path))
+    }
+
+    func testSuccessfulPageReplacementRemovesInvalidAndOlderFormats() throws {
+        let source = tempDirectory.appendingPathComponent("download.tmp")
+        let folder = tempDirectory.appendingPathComponent("pages")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("error".utf8).write(to: folder.appendingPathComponent("1.img"))
+        try makeJPEGData(color: .blue).write(to: folder.appendingPathComponent("1.jpg"))
+        let replacement = makeTransparentPNGData()
+        try replacement.write(to: source)
+        let stored = try XCTUnwrap(ImageService.shared.storePageImage(
+            imageUrl: source, destinationUrl: folder, pageNumber: "1"
+        ))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), ["1.png"])
+        XCTAssertEqual(ImageService.shared.storedImagePath(folderUrl: folder, pageNumber: "1"), stored)
+        XCTAssertEqual(try Data(contentsOf: stored), replacement)
+    }
+
+    func testPageStorageKeepsNewImageWhenFolderURLHasABaseURL() throws {
+        let source = tempDirectory.appendingPathComponent("download.tmp")
+        let folder = try XCTUnwrap(URL(string: "current%20session/pages/", relativeTo: tempDirectory))
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("error".utf8).write(to: folder.appendingPathComponent("1.img"))
+        let good = makeJPEGData(color: .blue)
+        try good.write(to: source)
+
+        let stored = try XCTUnwrap(ImageService.shared.storePageImage(
+            imageUrl: source, destinationUrl: folder, pageNumber: "1"
+        ))
+
+        XCTAssertEqual(try Data(contentsOf: stored), good)
+        let lookup = try XCTUnwrap(ImageService.shared.storedImagePath(folderUrl: folder, pageNumber: "1"))
+        XCTAssertEqual(try Data(contentsOf: lookup), good)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), ["1.jpg"])
     }
 
     func testStorePreviewImageWritesPreviewForCompleteJPEGData() throws {
@@ -104,14 +244,12 @@ class LANreaderTests: XCTestCase {
 
         try imageData.write(to: sourceURL, options: .atomic)
 
-        assertStoredPageImage(
+        XCTAssertNotNil(
             service.storePageImage(
                 imageUrl: sourceURL,
                 destinationUrl: tempDirectory,
-                pageNumber: "1",
-                splitWideImages: false
-            ),
-            shouldDisplayAsSplitPages: false
+                pageNumber: "1"
+            )
         )
 
         let storedURL = try XCTUnwrap(service.storedImagePath(folderUrl: tempDirectory, pageNumber: "1"))
@@ -126,14 +264,12 @@ class LANreaderTests: XCTestCase {
 
         try imageData.write(to: sourceURL, options: .atomic)
 
-        assertStoredPageImage(
+        XCTAssertNotNil(
             service.storePageImage(
                 imageUrl: sourceURL,
                 destinationUrl: tempDirectory,
-                pageNumber: "8",
-                splitWideImages: false
-            ),
-            shouldDisplayAsSplitPages: false
+                pageNumber: "8"
+            )
         )
 
         let storedURL = try XCTUnwrap(service.storedImagePath(folderUrl: tempDirectory, pageNumber: "8"))
@@ -155,19 +291,18 @@ class LANreaderTests: XCTestCase {
         )
         try imageData.write(to: sourceURL, options: .atomic)
 
-        assertStoredPageImage(
+        XCTAssertNotNil(
             service.storePageImage(
                 imageUrl: sourceURL,
                 destinationUrl: destinationDirectory,
-                pageNumber: "9",
-                splitWideImages: true
-            ),
-            shouldDisplayAsSplitPages: true
+                pageNumber: "9"
+            )
         )
 
         let storedURL = try XCTUnwrap(service.storedImagePath(folderUrl: destinationDirectory, pageNumber: "9"))
         XCTAssertEqual(storedURL.pathExtension, "png")
         XCTAssertEqual(try Data(contentsOf: storedURL), imageData)
+        XCTAssertTrue(service.shouldSplitWideImage(imageUrl: storedURL))
     }
 
     func testStorePageImagePreservesSmallJPEGWhenSourceIsExistingPageFile() throws {
@@ -177,14 +312,12 @@ class LANreaderTests: XCTestCase {
 
         try imageData.write(to: sourceURL, options: .atomic)
 
-        assertStoredPageImage(
+        XCTAssertNotNil(
             service.storePageImage(
                 imageUrl: sourceURL,
                 destinationUrl: tempDirectory,
-                pageNumber: "1",
-                splitWideImages: false
-            ),
-            shouldDisplayAsSplitPages: false
+                pageNumber: "1"
+            )
         )
 
         let storedURL = try XCTUnwrap(service.storedImagePath(folderUrl: tempDirectory, pageNumber: "1"))
@@ -199,14 +332,12 @@ class LANreaderTests: XCTestCase {
 
         try imageData.write(to: sourceURL, options: .atomic)
 
-        assertStoredPageImage(
+        XCTAssertNotNil(
             service.storePageImage(
                 imageUrl: sourceURL,
                 destinationUrl: tempDirectory,
-                pageNumber: "2",
-                splitWideImages: false
-            ),
-            shouldDisplayAsSplitPages: false
+                pageNumber: "2"
+            )
         )
 
         let storedURL = try XCTUnwrap(service.storedImagePath(folderUrl: tempDirectory, pageNumber: "2"))
@@ -221,14 +352,12 @@ class LANreaderTests: XCTestCase {
 
         try imageData.write(to: sourceURL, options: .atomic)
 
-        assertStoredPageImage(
+        XCTAssertNotNil(
             service.storePageImage(
                 imageUrl: sourceURL,
                 destinationUrl: tempDirectory,
-                pageNumber: "7",
-                splitWideImages: false
-            ),
-            shouldDisplayAsSplitPages: false
+                pageNumber: "7"
+            )
         )
 
         let storedURL = try XCTUnwrap(service.storedImagePath(folderUrl: tempDirectory, pageNumber: "7"))
@@ -246,14 +375,12 @@ class LANreaderTests: XCTestCase {
 
         try imageData.write(to: sourceURL, options: .atomic)
 
-        assertStoredPageImage(
+        XCTAssertNotNil(
             service.storePageImage(
                 imageUrl: sourceURL,
                 destinationUrl: tempDirectory,
-                pageNumber: "3",
-                splitWideImages: false
-            ),
-            shouldDisplayAsSplitPages: false
+                pageNumber: "3"
+            )
         )
 
         let storedURL = try XCTUnwrap(service.storedImagePath(folderUrl: tempDirectory, pageNumber: "3"))
@@ -273,14 +400,12 @@ class LANreaderTests: XCTestCase {
 
         try imageData.write(to: sourceURL, options: .atomic)
 
-        assertStoredPageImage(
+        XCTAssertNotNil(
             service.storePageImage(
                 imageUrl: sourceURL,
                 destinationUrl: tempDirectory,
-                pageNumber: "4",
-                splitWideImages: false
-            ),
-            shouldDisplayAsSplitPages: false
+                pageNumber: "4"
+            )
         )
 
         let storedURL = try XCTUnwrap(service.storedImagePath(folderUrl: tempDirectory, pageNumber: "4"))
@@ -300,19 +425,18 @@ class LANreaderTests: XCTestCase {
         try imageData.write(to: sourceURL, options: .atomic)
 
         XCTAssertTrue(service.isAnimatedImage(imageUrl: sourceURL))
-        assertStoredPageImage(
+        XCTAssertNotNil(
             service.storePageImage(
                 imageUrl: sourceURL,
                 destinationUrl: tempDirectory,
-                pageNumber: "5",
-                splitWideImages: true
-            ),
-            shouldDisplayAsSplitPages: false
+                pageNumber: "5"
+            )
         )
 
         let storedURL = try XCTUnwrap(service.storedImagePath(folderUrl: tempDirectory, pageNumber: "5"))
         XCTAssertEqual(storedURL.pathExtension, "gif")
         XCTAssertEqual(try Data(contentsOf: storedURL), imageData)
+        XCTAssertFalse(service.shouldSplitWideImage(imageUrl: storedURL))
     }
 
     func testStorePageImageWriteFailureDoesNotRemoveExistingCachedPage() throws {
@@ -350,26 +474,11 @@ class LANreaderTests: XCTestCase {
             service.storePageImage(
                 imageUrl: sourceURL,
                 destinationUrl: cacheFolder,
-                pageNumber: "6",
-                splitWideImages: false
+                pageNumber: "6"
             )
         )
         XCTAssertEqual(try Data(contentsOf: existingURL), existingData)
     }
-}
-
-private func assertStoredPageImage(
-    _ result: StoredPageImageResult?,
-    shouldDisplayAsSplitPages expected: Bool,
-    file: StaticString = #filePath,
-    line: UInt = #line
-) {
-    guard let result else {
-        XCTFail("Expected image to be stored", file: file, line: line)
-        return
-    }
-
-    XCTAssertEqual(result.shouldDisplayAsSplitPages, expected, file: file, line: line)
 }
 
 private func makeJPEGData(

@@ -36,6 +36,8 @@ public struct TankoubonDetailsMetadata: Equatable, Hashable, Sendable {
     public var tags: String
     public let includedArchiveTags: String
     var toc: [ArchiveChapter]?
+    var automaticChapterPages: Set<Int> = []
+    var defaultChapters: [ArchiveChapter] = []
 
     public init(id: String, name: String? = nil, tags: String = "", includedArchiveTags: String = "") {
         self.id = id
@@ -77,29 +79,5 @@ public struct TankoubonDetailsMetadata: Equatable, Hashable, Sendable {
 extension String {
     var isTankoubonArchiveId: Bool {
         hasPrefix("TANK_")
-    }
-}
-
-extension ArchiveItem {
-    func toArchive() -> Archive {
-        Archive(id: id,
-                isNew: isNew,
-                pageCount: pagecount,
-                progress: progress,
-                tags: tags.split(separator: ",").map(String.init),
-                title: name,
-                extension: `extension`,
-                lastUpdate: Date())
-    }
-}
-
-extension CategoryItem {
-    func toCategory() -> Category {
-        Category(id: id,
-                 name: name,
-                 archives: archives,
-                 search: search,
-                 pinned: pinned == "1" ? true : false,
-                 lastUpdate: Date())
     }
 }

@@ -39,6 +39,18 @@ The AppStore version is a paid app. You can still follow [Test on your device](#
 
 ![237701532-4518935c-ca93-43a8-b190-064c6424aea5](https://github.com/Doraemoe/LANreader/assets/1129569/e8dab3ba-8eb0-49e6-930e-2c8b2fbd5cad)
 
+## Deep links
+
+Other apps and shortcuts can open LANreader with links in the form `lanreader://<action>?<parameter>=<value>`. Percent-encode every value.
+
+| Link | Action |
+| --- | --- |
+| `lanreader://read?id=<archive-id>` | Opens the archive or Tankoubon in the reader at its saved page. Add `&preferCached=true` to open the downloaded copy offline when there is one. |
+| `lanreader://search?query=<query>` | Opens Search and runs the query. |
+| `lanreader://download?url=<url>` | Queues the `http` or `https` URL as a download on your LANraragi server, like the share extension. |
+
+Archive IDs come from the LANraragi server LANreader is connected to.
+
 ## Test on your device
 
 ### AltStore
@@ -51,6 +63,18 @@ The AppStore version is a paid app. You can still follow [Test on your device](#
 - Clone this project
 - Open it in Xcode
 - Follow [this guide](https://developer.apple.com/documentation/xcode/running-your-app-in-simulator-or-on-a-device)
+
+## Development quality
+
+Use the repository commands so local development and Continuous Integration (CI) exercise the same checks:
+
+- `./scripts/verify-changes` selects the quickest safe verification tier for the current diff.
+- `./scripts/verify` runs repository validation, strict SwiftLint, and the complete iOS test suite.
+- `./scripts/check-repo` runs fast structural checks for catalogs, data files, project files, workflows, scripts, and changed-line whitespace.
+
+Install the local verification tools with `brew install actionlint swiftlint`.
+
+The full workflow, risk-to-evidence guide, and learning loop are documented in [AI-native quality](docs/engineering/ai-native-quality.md).
 
 ## Donation
 

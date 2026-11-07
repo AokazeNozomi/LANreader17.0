@@ -45,12 +45,32 @@ enum ReadDirection: String, CaseIterable, Identifiable {
     var id: String { self.rawValue }
 }
 
-enum ArchiveListOrder: String, CaseIterable, Identifiable {
-    case name
-    case dateAdded
-    case random
+public enum ReaderPageLayoutMode: String, CaseIterable, Sendable {
+    case single
+    case double
+    case automatic
 
-    var id: String { self.rawValue }
+    init(automatic: Bool, double: Bool) {
+        self = automatic ? .automatic : (double ? .double : .single)
+    }
+
+    /// Choosing single or double also becomes the manual preference that applies when automatic is off.
+    func save(automatic: Shared<Bool>, double: Shared<Bool>) {
+        automatic.withLock { $0 = self == .automatic }
+        if self != .automatic {
+            double.withLock { $0 = self == .double }
+        }
+    }
+
+    var localizationKey: String { "settings.read.layout.\(rawValue)" }
+
+    var systemImage: String {
+        switch self {
+        case .single: "rectangle.portrait.fill"
+        case .double: "rectangle.split.2x1.fill"
+        case .automatic: "rectangle.2.swap"
+        }
+    }
 }
 
 enum SearchSort: String, CaseIterable, Identifiable {
@@ -76,18 +96,6 @@ enum SearchSortOrder: String, CaseIterable, Identifiable {
     var id: String { self.rawValue }
 }
 
-enum CompressThreshold: Int, CaseIterable, Identifiable {
-    case never, one, two, three, four
-
-    var id: Int { self.rawValue }
-}
-
-enum ArchiveSelectFor: Int, CaseIterable, Identifiable {
-    case library, categoryStatic, categoryDynamic, search
-
-    var id: Int { self.rawValue }
-}
-
 struct SettingsKey {
     static let lanraragiUrl = "settings:lanraragi:url"
     static let lanraragiApiKey = "settings:lanraragi:apiKey"
@@ -97,25 +105,25 @@ struct SettingsKey {
     static let tapMiddleKey = "settings:read:tap:middle"
     static let tapRightKey = "settings:read:tap:right"
     static let readDirection = "settings:read:direction"
-    static let showOriginal = "settings:read:image:showOriginal"
+    static let disablePageFlipAnimation = "settings:read:disable:page:flip:animation"
     static let splitWideImage = "settings:read:split:Image"
     static let splitPiorityLeft = "settings:read:split:piorityLeft"
     static let autoPageInterval = "settings:read:auto:page:interval"
     static let doublePageLayout = "settings:read:double:page"
+    static let automaticPageLayout = "settings:read:automatic:page:layout"
     static let fitPageWidth = "settings:read:fit:page:width"
+    static let showStamps = "settings:read:show:stamps"
     static let restartFinished = "settings:read:restart:finished"
 
     static let searchSort = "settings:search:sort"
     static let searchSortCustom = "settings:search:sort:custom"
     static let searchSortOrder = "settings:search:sort:order"
     static let blurInterfaceWhenInactive = "settings:view:blur:inactive"
-    static let enablePasscode = "settings:view:passcode:enable"
     static let passcode = "settings:view:passcode"
     static let hideRead = "settings:view:hideRead"
     static let paginateArchiveList = "settings:view:paginate"
 
     static let lastTagRefresh = "lastTagRefresh"
-    static let tabBarHidden = "tab:bar:hidden"
 
     static let translationUrl = "settings:advanced:translation:url"
     static let translationEnabled = "settings:advanced:translation:enabled"

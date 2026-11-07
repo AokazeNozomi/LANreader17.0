@@ -9,17 +9,22 @@ import SwiftUI
         @Shared(.appStorage(SettingsKey.tapMiddleKey)) var tapMiddle = PageControl.navigation.rawValue
         @Shared(.appStorage(SettingsKey.tapRightKey)) var tapRight = PageControl.previous.rawValue
         @Shared(.appStorage(SettingsKey.readDirection)) var readDirection = ReadDirection.leftRight.rawValue
-        @Shared(.appStorage(SettingsKey.showOriginal)) var showOriginal = false
+        @Shared(.appStorage(SettingsKey.disablePageFlipAnimation)) var disablePageFlipAnimation = false
         @Shared(.appStorage(SettingsKey.splitWideImage)) var splitWideImage = false
         @Shared(.appStorage(SettingsKey.splitPiorityLeft)) var splitPiorityLeft = false
         @Shared(.appStorage(SettingsKey.doublePageLayout)) var doublePageLayout = false
+        @Shared(.appStorage(SettingsKey.automaticPageLayout)) var automaticPageLayout = false
         @Shared(.appStorage(SettingsKey.fitPageWidth)) var fitPageWidth = false
         @Shared(.appStorage(SettingsKey.restartFinished)) var restartFinished = false
+
+        var pageLayoutMode: ReaderPageLayoutMode {
+            ReaderPageLayoutMode(automatic: automaticPageLayout, double: doublePageLayout)
+        }
     }
     public enum Action: BindableAction {
         case binding(BindingAction<State>)
         case splitWideImageChanged(Bool)
-        case doublePageLayoutChanged(Bool)
+        case pageLayoutModeChanged(ReaderPageLayoutMode)
     }
 
     public var body: some ReducerOf<Self> {
@@ -27,16 +32,14 @@ import SwiftUI
 
         Reduce { state, action in
             switch action {
+            case let .pageLayoutModeChanged(mode):
+                guard mode != .double || !state.splitWideImage else { return .none }
+                mode.save(automatic: state.$automaticPageLayout, double: state.$doublePageLayout)
+                return .none
             case let .splitWideImageChanged(isEnabled):
                 state.$splitWideImage.withLock { $0 = isEnabled }
                 if isEnabled {
                     state.$doublePageLayout.withLock { $0 = false }
-                }
-                return .none
-            case let .doublePageLayoutChanged(isEnabled):
-                state.$doublePageLayout.withLock { $0 = isEnabled }
-                if isEnabled {
-                    state.$splitWideImage.withLock { $0 = false }
                 }
                 return .none
             case .binding:
@@ -56,6 +59,8 @@ struct ReadSettings: View {
             Text("settings.read.direction.upDown").tag(ReadDirection.upDown.rawValue)
         }
         .padding()
+        Toggle("settings.read.disable.page.flip.animation", isOn: Binding(self.store.$disablePageFlipAnimation))
+            .padding()
         if store.readDirection != ReadDirection.upDown.rawValue {
             Picker("settings.read.tap.left", selection: Binding(self.store.$tapLeft)) {
                 pageControlSelectionView
@@ -73,12 +78,15 @@ struct ReadSettings: View {
             .padding()
         }
         if store.readDirection != ReadDirection.upDown.rawValue {
-            Toggle(isOn: Binding(
-                get: { self.store.doublePageLayout },
-                set: { self.store.send(.doublePageLayoutChanged($0)) }
+            Picker("settings.read.layout", selection: Binding(
+                get: { store.pageLayoutMode },
+                set: { store.send(.pageLayoutModeChanged($0)) }
             )) {
-                Text("settings.read.double.page")
+                ForEach(ReaderPageLayoutMode.allCases, id: \.self) { mode in
+                    Text(LocalizedStringKey(mode.localizationKey)).tag(mode)
+                }
             }
+            .disabled(store.splitWideImage)
             .padding()
             Toggle("settings.read.fit.page.width", isOn: Binding(self.store.$fitPageWidth))
                 .padding()

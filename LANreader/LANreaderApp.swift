@@ -11,37 +11,28 @@ struct LANreaderApp: App {
     @Environment(\.scenePhase) var scenePhase
     @Dependency(\.lanraragiService) var lanraragiService
 
-    let store = Store(initialState: AppFeature.State()) {
-        AppFeature()
-    }
+    let store: StoreOf<AppFeature>
 
     private let transactionObserver = TransactionObserver()
 
     init() {
         do {
-            if let tmp = try? FileManager.default.contentsOfDirectory(
-                at: FileManager.default.temporaryDirectory, includingPropertiesForKeys: []
-            ) {
-                tmp.forEach { url in
-                    try? FileManager.default.removeItem(at: url)
-                }
+            let staleItems = PageStorage.takeStaleItems(
+                temporaryFolder: FileManager.default.temporaryDirectory,
+                sessionFolder: LANraragiService.downloadPath,
+                legacySessionFolder: PageStorage.legacySessionFolder
+            )
+            Task.detached(priority: .utility) {
+                PageStorage.remove(staleItems)
+            }
+            if let cachePath = LANraragiService.cachePath {
+                try? PageStorage.excludeFromBackup(cachePath)
             }
 
             let logFileURL = try FileManager.default
                 .url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
                 .appendingPathComponent("app.log", conformingTo: .log)
             try? FileManager.default.removeItem(at: logFileURL)
-
-            if let path = LANraragiService.downloadPath {
-                if let sessionDownloadFolder = try? FileManager.default.contentsOfDirectory(
-                    at: path,
-                    includingPropertiesForKeys: []
-                ) {
-                    sessionDownloadFolder.forEach { url in
-                        try? FileManager.default.removeItem(at: url)
-                    }
-                }
-            }
 
             let console = ConsoleLogger("com.jif.LANreader.console")
             let fileLogger = try FileLogger(
@@ -62,6 +53,9 @@ struct LANreaderApp: App {
             }
         } catch {
             fatalError("Unresolved error \(error)")
+        }
+        store = Store(initialState: AppFeature.State()) {
+            AppFeature()
         }
     }
 
