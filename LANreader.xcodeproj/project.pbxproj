@@ -29,7 +29,6 @@
 		7D354CF324F222FC00617F4A /* README.md in Resources */ = {isa = PBXBuildFile; fileRef = 7D354CF224F222FC00617F4A /* README.md */; };
 		7D354D0524F2387900617F4A /* ViewModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D354D0424F2387900617F4A /* ViewModels.swift */; };
 		7D3DFF16251777B200686612 /* LANreaderApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D3DFF15251777B200686612 /* LANreaderApp.swift */; };
-		7D772E78250515C600070860 /* UpdateSearchCategoryResponse.json in Resources */ = {isa = PBXBuildFile; fileRef = 7D772E77250515C600070860 /* UpdateSearchCategoryResponse.json */; };
 		7D7A6845250241D80051F232 /* ServerInfoResponse.json in Resources */ = {isa = PBXBuildFile; fileRef = 7D7A6844250241D80051F232 /* ServerInfoResponse.json */; };
 		7D7B26A224F4D13600149341 /* LICENSE.md in Resources */ = {isa = PBXBuildFile; fileRef = 7D7B26A124F4D13600149341 /* LICENSE.md */; };
 		7D80326C24F68AB500AA8BD2 /* ArchiveCategoriesResponse.json in Resources */ = {isa = PBXBuildFile; fileRef = 7D80326B24F68AB500AA8BD2 /* ArchiveCategoriesResponse.json */; };
@@ -111,6 +110,7 @@
 		F1A2B3CC2F70000100AAA002 /* ArchiveListBatchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3CD2F70000100AAA002 /* ArchiveListBatchTests.swift */; };
 		F1A2B3CE2F70000100AAA003 /* ArchiveListHideReadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3CF2F70000100AAA003 /* ArchiveListHideReadTests.swift */; };
 		F1A2B3D22F70000100AAA005 /* DeepLinkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3D32F70000100AAA005 /* DeepLinkTests.swift */; };
+		F1A2B3D42F70000100AAA005 /* ViewSettingsFeatureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3D52F70000100AAA005 /* ViewSettingsFeatureTests.swift */; };
 		F1A2B3CE2F80000100AAA001 /* LogTextRendererTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3CF2F80000100AAA001 /* LogTextRendererTests.swift */; };
 		F1A2B3D52F60000400DDD001 /* LANraragiConfigFeatureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3D42F60000400DDD001 /* LANraragiConfigFeatureTests.swift */; };
 		F1A2B3D62F90000100AAA001 /* SearchKeyword.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3D72F90000100AAA001 /* SearchKeyword.swift */; };
@@ -120,6 +120,7 @@
 		F1A2B3E52FA0000100AAA001 /* PaginationPositioningTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3E62FA0000100AAA001 /* PaginationPositioningTests.swift */; };
 		F1A2B3F02FB0000100AAA001 /* ReaderPageLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3F12FB0000100AAA001 /* ReaderPageLayout.swift */; };
 		F1A2B3F22FC0000100AAA001 /* ReaderPositioningInvariantTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3F32FC0000100AAA001 /* ReaderPositioningInvariantTests.swift */; };
+		BADC0DE12FC0000100AAA001 /* AutomaticPageLayoutTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BADC0DE22FC0000100AAA001 /* AutomaticPageLayoutTests.swift */; };
 		F1A2B3F52FD0000100AAA001 /* StampOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3F42FD0000100AAA001 /* StampOverlayView.swift */; };
 		F1A2B3F62FD0000100AAA001 /* UploadFeatureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3F72FD0000100AAA001 /* UploadFeatureTests.swift */; };
 /* End PBXBuildFile section */
@@ -181,7 +182,6 @@
 		7D354CF224F222FC00617F4A /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		7D354D0424F2387900617F4A /* ViewModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewModels.swift; sourceTree = "<group>"; };
 		7D3DFF15251777B200686612 /* LANreaderApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LANreaderApp.swift; sourceTree = "<group>"; };
-		7D772E77250515C600070860 /* UpdateSearchCategoryResponse.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = UpdateSearchCategoryResponse.json; sourceTree = "<group>"; };
 		7D7A6844250241D80051F232 /* ServerInfoResponse.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = ServerInfoResponse.json; sourceTree = "<group>"; };
 		7D7B26A124F4D13600149341 /* LICENSE.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = LICENSE.md; sourceTree = "<group>"; };
 		7D80326B24F68AB500AA8BD2 /* ArchiveCategoriesResponse.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = ArchiveCategoriesResponse.json; sourceTree = "<group>"; };
@@ -257,6 +257,7 @@
 		F1A2B3CD2F70000100AAA002 /* ArchiveListBatchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArchiveListBatchTests.swift; sourceTree = "<group>"; };
 		F1A2B3CF2F70000100AAA003 /* ArchiveListHideReadTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArchiveListHideReadTests.swift; sourceTree = "<group>"; };
 		F1A2B3D32F70000100AAA005 /* DeepLinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLinkTests.swift; sourceTree = "<group>"; };
+		F1A2B3D52F70000100AAA005 /* ViewSettingsFeatureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewSettingsFeatureTests.swift; sourceTree = "<group>"; };
 		F1A2B3CF2F80000100AAA001 /* LogTextRendererTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogTextRendererTests.swift; sourceTree = "<group>"; };
 		F1A2B3D42F60000400DDD001 /* LANraragiConfigFeatureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LANraragiConfigFeatureTests.swift; sourceTree = "<group>"; };
 		F1A2B3D72F90000100AAA001 /* SearchKeyword.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchKeyword.swift; sourceTree = "<group>"; };
@@ -266,6 +267,7 @@
 		F1A2B3E62FA0000100AAA001 /* PaginationPositioningTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PaginationPositioningTests.swift; sourceTree = "<group>"; };
 		F1A2B3F12FB0000100AAA001 /* ReaderPageLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReaderPageLayout.swift; sourceTree = "<group>"; };
 		F1A2B3F32FC0000100AAA001 /* ReaderPositioningInvariantTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReaderPositioningInvariantTests.swift; sourceTree = "<group>"; };
+		BADC0DE22FC0000100AAA001 /* AutomaticPageLayoutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutomaticPageLayoutTests.swift; sourceTree = "<group>"; };
 		F1A2B3F42FD0000100AAA001 /* StampOverlayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StampOverlayView.swift; sourceTree = "<group>"; };
 		F1A2B3F72FD0000100AAA001 /* UploadFeatureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UploadFeatureTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -490,11 +492,13 @@
 				F1A2B3CD2F70000100AAA002 /* ArchiveListBatchTests.swift */,
 				F1A2B3CF2F70000100AAA003 /* ArchiveListHideReadTests.swift */,
 				F1A2B3D32F70000100AAA005 /* DeepLinkTests.swift */,
+				F1A2B3D52F70000100AAA005 /* ViewSettingsFeatureTests.swift */,
 				AB3870010000000000000002 /* ArchiveListSelectionTests.swift */,
 				F1A2B3CF2F80000100AAA001 /* LogTextRendererTests.swift */,
 				F1A2B3D92F90000200AAA001 /* SearchFeatureTests.swift */,
 				F1A2B3E62FA0000100AAA001 /* PaginationPositioningTests.swift */,
 				F1A2B3F32FC0000100AAA001 /* ReaderPositioningInvariantTests.swift */,
+				BADC0DE22FC0000100AAA001 /* AutomaticPageLayoutTests.swift */,
 				F1A2B3F72FD0000100AAA001 /* UploadFeatureTests.swift */,
 				7D354CB824F1316E00617F4A /* Info.plist */,
 				4BD820A697A4726B7B747BFD /* Service */,
@@ -515,7 +519,6 @@
 				7D80326D24F68F6900AA8BD2 /* ArchiveSearchResponse.json */,
 				7D7A6844250241D80051F232 /* ServerInfoResponse.json */,
 				7DE70F552503C7B3006414DE /* ClearNewFlagResponse.json */,
-				7D772E77250515C600070860 /* UpdateSearchCategoryResponse.json */,
 				7DE57779250780C100FD1603 /* SetArchiveMetadataResponse.json */,
 				7DF6FFB1252DCE97009280A5 /* UnauthorizedResponse.json */,
 			);
@@ -734,7 +737,6 @@
 				7DE70F562503C7B3006414DE /* ClearNewFlagResponse.json in Resources */,
 				7D354CF124F21B3400617F4A /* ArchiveExtractResponse.json in Resources */,
 				7DF6FFB2252DCE97009280A5 /* UnauthorizedResponse.json in Resources */,
-				7D772E78250515C600070860 /* UpdateSearchCategoryResponse.json in Resources */,
 				7D7A6845250241D80051F232 /* ServerInfoResponse.json in Resources */,
 				7D80326E24F68F6900AA8BD2 /* ArchiveSearchResponse.json in Resources */,
 				7DF2E89D24F7D30700689A6D /* ArchiveMetadataResponse.json in Resources */,
@@ -845,10 +847,12 @@
 				F1A2B3CC2F70000100AAA002 /* ArchiveListBatchTests.swift in Sources */,
 				F1A2B3CE2F70000100AAA003 /* ArchiveListHideReadTests.swift in Sources */,
 				F1A2B3D22F70000100AAA005 /* DeepLinkTests.swift in Sources */,
+				F1A2B3D42F70000100AAA005 /* ViewSettingsFeatureTests.swift in Sources */,
 				AB3870010000000000000001 /* ArchiveListSelectionTests.swift in Sources */,
 				F1A2B3CE2F80000100AAA001 /* LogTextRendererTests.swift in Sources */,
 				F1A2B3E52FA0000100AAA001 /* PaginationPositioningTests.swift in Sources */,
 				F1A2B3F22FC0000100AAA001 /* ReaderPositioningInvariantTests.swift in Sources */,
+				BADC0DE12FC0000100AAA001 /* AutomaticPageLayoutTests.swift in Sources */,
 				F1A2B3F62FD0000100AAA001 /* UploadFeatureTests.swift in Sources */,
 				F1A2B3D82F90000200AAA001 /* SearchFeatureTests.swift in Sources */,
 				4BD82555CE41A0467CCC6411 /* LANraragiServiceTest.swift in Sources */,
@@ -1027,7 +1031,7 @@
 				CODE_SIGN_ENTITLEMENTS = LANreader/LANreader.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 264;
+				CURRENT_PROJECT_VERSION = 273;
 				DEVELOPMENT_ASSET_PATHS = "\"LANreader/Preview Content\"";
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
@@ -1038,7 +1042,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.11.6;
+				MARKETING_VERSION = 3.11.7;
 				PRODUCT_BUNDLE_IDENTIFIER = com.jif.LANreader.3;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -1055,7 +1059,7 @@
 				CODE_SIGN_ENTITLEMENTS = LANreader/LANreaderRelease.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 264;
+				CURRENT_PROJECT_VERSION = 273;
 				DEVELOPMENT_ASSET_PATHS = "\"LANreader/Preview Content\"";
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
@@ -1066,7 +1070,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.11.6;
+				MARKETING_VERSION = 3.11.7;
 				PRODUCT_BUNDLE_IDENTIFIER = com.jif.LANreader.3;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -1129,7 +1133,7 @@
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 264;
+				CURRENT_PROJECT_VERSION = 273;
 				DEVELOPMENT_TEAM = UUEBW58SA6;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Action/Info.plist;
@@ -1141,7 +1145,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 3.11.6;
+				MARKETING_VERSION = 3.11.7;
 				PRODUCT_BUNDLE_IDENTIFIER = com.jif.LANreader.3.Action;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -1159,7 +1163,7 @@
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 264;
+				CURRENT_PROJECT_VERSION = 273;
 				DEVELOPMENT_TEAM = UUEBW58SA6;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Action/Info.plist;
@@ -1171,7 +1175,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 3.11.6;
+				MARKETING_VERSION = 3.11.7;
 				PRODUCT_BUNDLE_IDENTIFIER = com.jif.LANreader.3.Action;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";

@@ -30,6 +30,8 @@ import Logging
         case jobPolling
     }
 
+    private static let jobRetention: TimeInterval = 24 * 60 * 60
+
     @Dependency(\.lanraragiService) var service
     @Dependency(\.appDatabase) var database
     @Dependency(\.continuousClock) var clock
@@ -115,20 +117,16 @@ import Logging
                         var currentJobs: [DownloadJob] = []
                         var expiredJobIDs: Set<Int> = []
                         for job in downloadJobs {
-                            if job.lastUpdate.addingTimeInterval(3600) < now {
+                            if isFinished(job) && isExpired(job) {
                                 expiredJobIDs.insert(job.id)
-                                do {
-                                    _ = try database.deleteDownloadJobs(job.id)
-                                } catch {
-                                    logger.error("failed to delete expired download job. id=\(job.id), \(error)")
-                                }
+                                deleteExpiredJob(job.id)
                                 continue
                             }
                             currentJobs.append(job)
                         }
                         await send(.jobsLoaded(currentJobs, expiredJobIDs: expiredJobIDs))
 
-                        let unfinishedJobs = currentJobs.filter { !$0.isSuccess && !$0.isError }
+                        let unfinishedJobs = currentJobs.filter { !isFinished($0) }
                         guard !unfinishedJobs.isEmpty else {
                             return
                         }
@@ -145,7 +143,7 @@ import Logging
                                     logger.error("failed to save updated job to database. id=\(job.id), \(error)")
                                 }
                                 await send(.jobStatusUpdated(downloadJob))
-                                if !downloadJob.isSuccess && !downloadJob.isError {
+                                if !isFinished(downloadJob) {
                                     shouldContinuePolling = true
                                 }
                             } catch {
@@ -153,6 +151,11 @@ import Logging
                                     return
                                 }
                                 logger.error("failed to check job status. id=\(job.id) \(error)")
+                                if isExpired(job) {
+                                    deleteExpiredJob(job.id)
+                                    await send(.jobsLoaded([], expiredJobIDs: [job.id]))
+                                    continue
+                                }
                                 shouldContinuePolling = true
                             }
                         }
@@ -170,6 +173,22 @@ import Logging
         }
     }
 
+    private func isFinished(_ job: DownloadJob) -> Bool {
+        job.isSuccess || job.isError
+    }
+
+    private func isExpired(_ job: DownloadJob) -> Bool {
+        job.lastUpdate.addingTimeInterval(Self.jobRetention) < now
+    }
+
+    private func deleteExpiredJob(_ id: Int) {
+        do {
+            _ = try database.deleteDownloadJobs(id)
+        } catch {
+            logger.error("failed to delete expired download job. id=\(id), \(error)")
+        }
+    }
+
     private func queueDownloadJobs(_ urls: String) async -> [DownloadJob] {
         var jobs: [DownloadJob] = .init()
         for url in urls.split(whereSeparator: \.isNewline) {
@@ -177,17 +196,7 @@ import Logging
             if !processedUrl.isEmpty {
                 do {
                     let response = try await service.queueUrlDownload(downloadUrl: processedUrl).value
-                    if response.success == 1 {
-                        var downloadJob = DownloadJob(
-                            id: response.job,
-                            url: response.url,
-                            title: "",
-                            isActive: true,
-                            isSuccess: false,
-                            isError: false,
-                            message: "",
-                            lastUpdate: now
-                        )
+                    if var downloadJob = response.toQueuedDownloadJob(lastUpdate: now) {
                         try? database.saveDownloadJob(&downloadJob)
                         jobs.append(downloadJob)
                     } else {
